@@ -14,7 +14,10 @@
       "Bash(npm test:*)",
       "Bash(mkdir:*)",
       "Bash(npm run test:unit:*)",
-      "Bash(npm run test:integration:*)"
+      "Bash(npm run test:integration:*)",
+      "Bash(npx jest:*)",
+      "Bash(git stash:*)",
+      "Bash(git stash pop:*)"
     ],
     "deny": [],
     "ask": []

@@ -3,6 +3,10 @@
  *
  * Retrieves and weaves memories into context before each LLM call
  * Ranks by confidence, recency, and tier
+ *
+ * NEW: Also supports deterministic agent state loading by agent_id.
+ * buildStateContext() loads active state entries and formats as
+ * structured AGENT OPERATIONAL STATE injection — no semantic search.
  */
 
 import { RecallBricksClient } from '../api/RecallBricksClient';
@@ -12,6 +16,8 @@ import {
   ContextPrompt,
   RecallMemory,
   Logger,
+  AgentStateEntry,
+  AgentOperationalState,
 } from '../types';
 
 // ============================================================================
@@ -38,6 +44,13 @@ export interface Context {
   systemPrompt: string;
 }
 
+export interface StateContext {
+  identity: AgentIdentity;
+  operationalState: AgentOperationalState;
+  stateEntries: AgentStateEntry[];
+  systemPrompt: string;
+}
+
 export interface ContextBuildOptions {
   query?: string;
   includeRecent?: boolean;
@@ -52,6 +65,7 @@ export interface ContextBuildOptions {
 export class ContextWeaver {
   private identity: AgentIdentity;
   private lastContext?: Context;
+  private lastStateContext?: StateContext;
 
   constructor(private config: ContextWeaverConfig) {
     // Build identity from config
@@ -74,6 +88,224 @@ export class ContextWeaver {
       maxMemories: config.maxContextMemories,
     });
   }
+
+  // ==========================================================================
+  // Deterministic State Context (new — primary path)
+  // ==========================================================================
+
+  /**
+   * Build context from agent state entries — deterministic, no semantic search.
+   * Loads by agent_id and filters by active/outcome status.
+   *
+   * Also accepts local state entries (from AutoSaver) as supplement
+   * in case the API endpoint is not yet available.
+   */
+  async buildStateContext(localEntries?: AgentStateEntry[]): Promise<StateContext> {
+    this.config.logger.debug('Building state context (deterministic)');
+
+    const startTime = Date.now();
+
+    // 1. Load active state entries for this agent_id from API
+    let entries: AgentStateEntry[] = [];
+    try {
+      const activeResponse = await this.config.apiClient.getAgentState(
+        this.config.agentId,
+        { activeOnly: true }
+      );
+      entries = activeResponse?.entries ?? [];
+    } catch {
+      this.config.logger.warn('Could not load state from API, using local entries only');
+    }
+
+    // Merge local entries (deduped by id)
+    if (localEntries && localEntries.length > 0) {
+      const existingIds = new Set(entries.map(e => e.id));
+      for (const local of localEntries) {
+        if (!existingIds.has(local.id)) {
+          entries.push(local);
+        }
+      }
+    }
+
+    // 2. Load recent failures (last 10 where outcome = 'failure')
+    let failures: AgentStateEntry[] = [];
+    try {
+      const failureResponse = await this.config.apiClient.getAgentState(
+        this.config.agentId,
+        { outcome: 'failure', limit: 10 }
+      );
+      failures = failureResponse?.entries ?? [];
+    } catch {
+      // Fall back to local failures
+      failures = entries.filter(e => e.outcome === 'failure').slice(-10);
+    }
+
+    // Merge failures into entries (deduped)
+    const allIds = new Set(entries.map(e => e.id));
+    for (const f of failures) {
+      if (!allIds.has(f.id)) {
+        entries.push(f);
+        allIds.add(f.id);
+      }
+    }
+
+    // 3. Build operational state
+    const operationalState = this.buildOperationalState(entries);
+
+    // 4. Format as system prompt
+    const statePrompt = this.formatStateSystemPrompt(this.identity, operationalState);
+
+    const stateContext: StateContext = {
+      identity: this.identity,
+      operationalState,
+      stateEntries: entries,
+      systemPrompt: statePrompt,
+    };
+
+    this.lastStateContext = stateContext;
+
+    const duration = Date.now() - startTime;
+    this.config.logger.info('State context built successfully', {
+      duration: `${duration}ms`,
+      entriesLoaded: entries.length,
+      activeGoals: operationalState.activeGoals.length,
+      constraints: operationalState.activeConstraints.length,
+      failures: operationalState.recentFailures.length,
+    });
+
+    return stateContext;
+  }
+
+  /**
+   * Build AgentOperationalState from state entries
+   */
+  private buildOperationalState(entries: AgentStateEntry[]): AgentOperationalState {
+    const activeEntries = entries.filter(e => e.active);
+    const failureEntries = entries
+      .filter(e => e.outcome === 'failure')
+      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+      .slice(0, 10);
+
+    // Extract unique active goals
+    const activeGoals = [...new Set(
+      activeEntries
+        .filter(e => e.outcome !== 'success')
+        .map(e => e.goal)
+    )];
+
+    // Extract discovered constraints
+    const activeConstraints = [
+      ...new Set(
+        entries
+          .map(e => e.constraint_discovered)
+          .filter((c): c is string => c !== null)
+      ),
+    ];
+
+    // Extract recent failures with lessons
+    const recentFailures = failureEntries.map(e => ({
+      goal: e.goal,
+      action: e.action,
+      result_summary: e.result_summary,
+      lesson: e.lesson,
+    }));
+
+    // Extract active directives
+    const directives: AgentOperationalState['directives'] = [];
+    for (const entry of activeEntries) {
+      if (entry.override) {
+        directives.push({ type: 'override' as const, content: entry.override });
+      }
+      if (entry.recommendation) {
+        directives.push({ type: 'recommendation' as const, content: entry.recommendation });
+      }
+    }
+
+    // Merge current system state from the most recent entry
+    const mostRecent = entries
+      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())[0];
+    const currentState = mostRecent?.state_after ?? {};
+
+    return {
+      activeGoals,
+      activeConstraints,
+      recentFailures,
+      directives,
+      currentState,
+    };
+  }
+
+  /**
+   * Format the agent operational state into a system prompt section
+   */
+  private formatStateSystemPrompt(
+    identity: AgentIdentity,
+    state: AgentOperationalState
+  ): string {
+    const identitySection = this.formatIdentitySection(identity);
+    const rulesSection = this.formatRulesSection(identity);
+
+    let stateSection = 'AGENT OPERATIONAL STATE:\n';
+
+    // Current goals
+    if (state.activeGoals.length > 0) {
+      stateSection += `\nCurrent goals:\n`;
+      state.activeGoals.forEach(g => {
+        stateSection += `- ${g}\n`;
+      });
+    } else {
+      stateSection += `\nCurrent goals: none\n`;
+    }
+
+    // Active constraints
+    if (state.activeConstraints.length > 0) {
+      stateSection += `\nActive constraints:\n`;
+      state.activeConstraints.forEach(c => {
+        stateSection += `- ${c}\n`;
+      });
+    }
+
+    // Recent failures
+    if (state.recentFailures.length > 0) {
+      stateSection += `\nRecent failures:\n`;
+      state.recentFailures.forEach(f => {
+        stateSection += `- Goal: ${f.goal} | Action: ${f.action} | Result: ${f.result_summary}`;
+        if (f.lesson) stateSection += ` | Lesson: ${f.lesson}`;
+        stateSection += '\n';
+      });
+    }
+
+    // Directives
+    if (state.directives.length > 0) {
+      stateSection += `\nDirectives:\n`;
+      state.directives.forEach(d => {
+        stateSection += `- [${d.type.toUpperCase()}] ${d.content}\n`;
+      });
+    }
+
+    // Current system state
+    const stateKeys = Object.keys(state.currentState);
+    if (stateKeys.length > 0) {
+      stateSection += `\nCurrent system state:\n`;
+      for (const key of stateKeys.slice(0, 20)) {
+        const val = state.currentState[key];
+        stateSection += `- ${key}: ${JSON.stringify(val)}\n`;
+      }
+    }
+
+    return `${identitySection}\n\n${stateSection.trim()}\n\n${rulesSection}`;
+  }
+
+  /**
+   * Get last built state context
+   */
+  getLastStateContext(): StateContext | undefined {
+    return this.lastStateContext;
+  }
+
+  // ==========================================================================
+  // Legacy Memory-based Context (preserved as fallback)
+  // ==========================================================================
 
   /**
    * Build context for an LLM call

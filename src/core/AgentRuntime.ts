@@ -21,11 +21,12 @@ import {
   WorkingMemorySession,
   GoalTrackingResult,
   MetacognitionAssessment,
+  AgentStateEntry,
 } from '../types';
 import { buildConfigFromOptions, createLogger } from '../config';
 import { LLMAdapter } from './LLMAdapter';
 import { ContextLoader } from './ContextLoader';
-import { ContextWeaver, Context } from './ContextWeaver';
+import { ContextWeaver, Context, StateContext } from './ContextWeaver';
 import { AutoSaver } from './AutoSaver';
 import { IdentityValidator } from './IdentityValidator';
 import { ReflectionEngine, Reflection, ReasoningTrace } from './ReflectionEngine';
@@ -35,7 +36,7 @@ import { RecallBricksClient } from '../api/RecallBricksClient';
 // Runtime Version
 // ============================================================================
 
-const RUNTIME_VERSION = '1.3.0';
+const RUNTIME_VERSION = '2.0.0';
 
 // ============================================================================
 // Agent Runtime Implementation
@@ -55,6 +56,7 @@ export class AgentRuntime {
   private currentIdentity?: AgentIdentity;
   private currentContext?: MemoryContext;
   private weavedContext?: Context;
+  private stateContext?: StateContext;
   private previousTurn?: ConversationTurn;
   private conversationHistory: LLMMessage[] = [];
   private interactionCount = 0;
@@ -116,7 +118,7 @@ export class AgentRuntime {
       logger: this.logger,
     });
 
-    // Initialize AutoSaver
+    // Initialize AutoSaver (with API client for state tracking)
     this.autoSaver = new AutoSaver({
       apiUrl: this.config.apiUrl!,
       apiKey: this.config.apiKey || '',
@@ -124,6 +126,7 @@ export class AgentRuntime {
       userId: this.config.userId,
       tier: this.config.tier!,
       logger: this.logger,
+      apiClient: this.apiClient,
     });
 
     // Initialize ReflectionEngine if LLM is available
@@ -385,16 +388,28 @@ export class AgentRuntime {
     this.interactionCount++;
 
     try {
-      // Step 1: Save previous turn (if exists)
+      // Step 1: Save previous turn (if exists) — both legacy memory and state entry
       if (this.previousTurn && this.config.autoSave) {
         this.logger.debug('Saving previous conversation turn');
-        await this.autoSaver.save(this.previousTurn);
+        // Legacy memory save (non-blocking)
+        this.autoSaver.save(this.previousTurn).catch((err) => {
+          this.logger.warn('Legacy memory save failed', { error: (err as Error).message });
+        });
+        // State entry extraction and save (non-blocking)
+        this.autoSaver.saveStateEntry(this.previousTurn).catch((err) => {
+          this.logger.warn('State entry save failed', { error: (err as Error).message });
+        });
       }
 
-      // Step 2: Build context using ContextWeaver
+      // Step 2a: Build deterministic state context
+      this.logger.debug('Building agent state context (deterministic)');
+      const localEntries = this.autoSaver.getActiveStateEntries();
+      this.stateContext = await this.contextWeaver!.buildStateContext(localEntries);
+      this.currentIdentity = this.stateContext.identity;
+
+      // Step 2b: Also build legacy memory context (fallback / compatibility)
       this.logger.debug('Building context from Memory Graph');
       this.weavedContext = await this.contextWeaver!.buildContext(message);
-      this.currentIdentity = this.weavedContext.identity;
 
       // Convert to legacy MemoryContext format for compatibility
       this.currentContext = {
@@ -543,16 +558,53 @@ export class AgentRuntime {
 
   /**
    * Explain reasoning for a query (Chain of Thought)
+   *
+   * Primary path: builds trace from state entries (no LLM call).
+   * Fallback: uses LLM-based explain if no state entries exist.
    */
   async explain(query: string): Promise<ReasoningTrace> {
     if (!this.reflectionEngine) {
       throw new Error('Reflection engine not initialized (requires LLM adapter)');
     }
 
-    // Get relevant memories for the query
-    const context = await this.contextWeaver!.buildContext(query);
+    // Primary: explain from agent state entries (no LLM call)
+    const localEntries = this.autoSaver.getStateEntries();
+    let apiEntries: AgentStateEntry[] = [];
+    try {
+      const response = await this.apiClient.getAgentState(this.config.agentId);
+      apiEntries = response.entries;
+    } catch {
+      this.logger.debug('Could not fetch API state entries for explain');
+    }
 
+    // Merge and dedupe
+    const allEntries = [...localEntries];
+    const localIds = new Set(localEntries.map(e => e.id));
+    for (const e of apiEntries) {
+      if (!localIds.has(e.id)) allEntries.push(e);
+    }
+
+    if (allEntries.length > 0) {
+      return this.reflectionEngine.explainFromState(query, allEntries);
+    }
+
+    // Fallback: LLM-based explain using memories
+    const context = await this.contextWeaver!.buildContext(query);
     return this.reflectionEngine.explain(query, context.memories);
+  }
+
+  /**
+   * Get all agent state entries (local + API)
+   */
+  getStateEntries(): AgentStateEntry[] {
+    return this.autoSaver.getStateEntries();
+  }
+
+  /**
+   * Get active agent state entries
+   */
+  getActiveStateEntries(): AgentStateEntry[] {
+    return this.autoSaver.getActiveStateEntries();
   }
 
   /**
@@ -564,14 +616,21 @@ export class AgentRuntime {
   ): LLMMessage[] {
     const messages: LLMMessage[] = [];
 
-    // Add system prompt with identity and context from ContextWeaver
-    if (this.weavedContext) {
+    // Add system prompt — prefer state context (deterministic), fallback to memory context
+    if (this.stateContext && this.stateContext.stateEntries.length > 0) {
+      // Primary: deterministic agent state context
+      messages.push({
+        role: 'system',
+        content: this.stateContext.systemPrompt,
+      });
+    } else if (this.weavedContext) {
+      // Fallback: semantic memory context
       messages.push({
         role: 'system',
         content: this.weavedContext.systemPrompt,
       });
     } else if (this.currentIdentity && this.currentContext) {
-      // Fallback to legacy ContextLoader
+      // Legacy fallback: ContextLoader
       const contextPrompt = this.contextLoader.formatContextPrompt(
         this.currentIdentity,
         this.currentContext

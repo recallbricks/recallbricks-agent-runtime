@@ -11,6 +11,11 @@ import {
   RecallResponse,
   RecallMemory,
   Logger,
+  AgentStateEntry,
+  SaveStateResponse,
+  GetAgentStateResponse,
+  ExplainResponse,
+  AgentStateOutcome,
 } from '../types';
 
 // ============================================================================
@@ -230,6 +235,95 @@ export class RecallBricksClient {
         );
       },
     });
+  }
+
+  // ==========================================================================
+  // Agent State Endpoints (primary)
+  // ==========================================================================
+
+  /**
+   * Save an agent state entry
+   * POST /api/v1/state
+   */
+  async saveState(entry: Omit<AgentStateEntry, 'id'>): Promise<SaveStateResponse> {
+    this.logger?.debug('Saving agent state entry', { agent_id: entry.agent_id, goal: entry.goal });
+
+    try {
+      return await this.withRetry(async () => {
+        const response = await this.client.post<SaveStateResponse>(
+          '/api/v1/state',
+          { entry }
+        );
+        return response.data;
+      });
+    } catch {
+      // Fallback: save as memory if state endpoint not available
+      this.logger?.warn('State endpoint not available, falling back to memory endpoint');
+      const memResponse = await this.saveMemory({
+        text: JSON.stringify(entry),
+        tags: ['agent_state', entry.agent_id, entry.outcome],
+        source: 'agent-state-tracker',
+        metadata: {
+          agent_id: entry.agent_id,
+          goal: entry.goal,
+          outcome: entry.outcome,
+          active: entry.active,
+        },
+      });
+      return { id: memResponse.id, created_at: memResponse.created_at };
+    }
+  }
+
+  /**
+   * Get current agent state entries
+   * GET /api/v1/state/:agent_id
+   */
+  async getAgentState(
+    agentId: string,
+    options: { activeOnly?: boolean; outcome?: AgentStateOutcome; limit?: number } = {}
+  ): Promise<GetAgentStateResponse> {
+    this.logger?.debug('Fetching agent state', { agentId, options });
+
+    try {
+      return await this.withRetry(async () => {
+        const params: Record<string, string | number | boolean> = {};
+        if (options.activeOnly !== undefined) params.active_only = options.activeOnly;
+        if (options.outcome) params.outcome = options.outcome;
+        if (options.limit) params.limit = options.limit;
+
+        const response = await this.client.get<GetAgentStateResponse>(
+          `/api/v1/state/${encodeURIComponent(agentId)}`,
+          { params }
+        );
+        return response.data;
+      });
+    } catch {
+      // Fallback: return empty state if endpoint not available
+      this.logger?.warn('State endpoint not available, returning empty state');
+      return { entries: [], total: 0 };
+    }
+  }
+
+  /**
+   * Get reasoning trace explanation for an agent
+   * POST /api/v1/state/:agent_id/explain
+   */
+  async getExplanation(agentId: string, goal?: string): Promise<ExplainResponse> {
+    this.logger?.debug('Fetching agent explanation', { agentId, goal });
+
+    try {
+      return await this.withRetry(async () => {
+        const response = await this.client.post<ExplainResponse>(
+          `/api/v1/state/${encodeURIComponent(agentId)}/explain`,
+          { goal }
+        );
+        return response.data;
+      });
+    } catch {
+      // Fallback: return empty trace
+      this.logger?.warn('Explain endpoint not available');
+      return { trace: '', entries_used: 0 };
+    }
   }
 
   /**

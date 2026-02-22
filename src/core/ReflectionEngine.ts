@@ -13,6 +13,7 @@ import {
   ConversationTurn,
   Logger,
   LLMMessage,
+  AgentStateEntry,
 } from '../types';
 
 // ============================================================================
@@ -61,6 +62,7 @@ export interface ReasoningTrace {
   conclusion: string;
   confidence: number;
   memoryReferences: string[];
+  stateReferences?: string[];
 }
 
 export interface ReasoningStep {
@@ -249,6 +251,99 @@ export class ReflectionEngine {
       conclusion,
       confidence,
       memoryReferences: memoryRefs,
+    };
+  }
+
+  /**
+   * Build a reasoning trace from agent state entries — no LLM call needed.
+   *
+   * "I attempted X because of Y. It failed due to Z. I learned Q.
+   *  Current directive: do not retry prior path. Next approach: W."
+   */
+  explainFromState(query: string, stateEntries: AgentStateEntry[]): ReasoningTrace {
+    this.config.logger.debug('Building reasoning trace from state entries', {
+      query,
+      entryCount: stateEntries.length,
+    });
+
+    if (stateEntries.length === 0) {
+      return {
+        query,
+        steps: [{ thought: 'No prior state entries found for this agent.' }],
+        conclusion: 'No operational history available to explain.',
+        confidence: 0.3,
+        memoryReferences: [],
+        stateReferences: [],
+      };
+    }
+
+    // Sort entries chronologically
+    const sorted = [...stateEntries].sort(
+      (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+    );
+
+    // Build reasoning steps from state entries
+    const steps: ReasoningStep[] = [];
+    const stateRefs: string[] = [];
+
+    for (const entry of sorted) {
+      stateRefs.push(entry.id);
+
+      const step: ReasoningStep = {
+        thought: `I attempted "${entry.goal}" by ${entry.action}. Reasoning: ${entry.reasoning}`,
+        observation: `Outcome: ${entry.outcome} — ${entry.result_summary}`,
+      };
+
+      if (entry.lesson) {
+        step.action = `Lesson learned: ${entry.lesson}`;
+      }
+
+      steps.push(step);
+    }
+
+    // Build conclusion from the most recent active entries
+    const activeEntries = sorted.filter(e => e.active);
+    const failures = sorted.filter(e => e.outcome === 'failure');
+    const latestEntry = sorted[sorted.length - 1];
+
+    let conclusion = '';
+
+    if (failures.length > 0) {
+      const lastFailure = failures[failures.length - 1];
+      conclusion += `I attempted "${lastFailure.goal}" and it failed: ${lastFailure.result_summary}. `;
+      if (lastFailure.lesson) {
+        conclusion += `I learned: ${lastFailure.lesson}. `;
+      }
+    }
+
+    // Add active directives
+    const directives = activeEntries.filter(e => e.override || e.recommendation);
+    if (directives.length > 0) {
+      const directive = directives[directives.length - 1];
+      if (directive.override) {
+        conclusion += `Current directive: ${directive.override}. `;
+      }
+      if (directive.recommendation) {
+        conclusion += `Next approach: ${directive.recommendation}. `;
+      }
+    }
+
+    if (!conclusion) {
+      conclusion = `Last action: "${latestEntry.goal}" — ${latestEntry.outcome}: ${latestEntry.result_summary}`;
+    }
+
+    // Calculate confidence based on number and quality of entries
+    const avgConfidence =
+      sorted.reduce((sum, e) => sum + e.confidence, 0) / sorted.length;
+    const confidence = Math.min(1, avgConfidence + steps.length * 0.02);
+
+    return {
+      query,
+      steps,
+      conclusion: conclusion.trim(),
+      confidence,
+      memoryReferences: [],
+      stateReferences: stateRefs,
     };
   }
 

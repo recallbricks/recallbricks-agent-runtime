@@ -10,8 +10,9 @@ export { AgentRuntime } from './core/AgentRuntime';
 export { LLMAdapter } from './core/LLMAdapter';
 export { ContextLoader } from './core/ContextLoader';
 export { ContextWeaver } from './core/ContextWeaver';
-export type { Context, ContextWeaverConfig, ContextBuildOptions } from './core/ContextWeaver';
+export type { Context, StateContext, ContextWeaverConfig, ContextBuildOptions } from './core/ContextWeaver';
 export { AutoSaver } from './core/AutoSaver';
+export type { StateExtractionContext } from './core/AutoSaver';
 export { IdentityValidator } from './core/IdentityValidator';
 export { ReflectionEngine } from './core/ReflectionEngine';
 export type {

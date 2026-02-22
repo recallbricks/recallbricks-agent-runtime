@@ -493,3 +493,19 @@ export interface MetacognitionClient {
   getAverageConfidence(): Promise<number>;
   triggerReflection(): Promise<void>;
 }
+
+// ============================================================================
+// Re-export Agent State Types
+// ============================================================================
+
+export type {
+  AgentStateOutcome,
+  AgentStateEntry,
+  SaveStateRequest,
+  SaveStateResponse,
+  GetAgentStateRequest,
+  GetAgentStateResponse,
+  ExplainRequest,
+  ExplainResponse,
+  AgentOperationalState,
+} from './AgentState';
