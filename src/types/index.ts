@@ -4,6 +4,8 @@
  * Type definitions for the universal cognitive runtime
  */
 
+import type { ConstraintViolation } from './AgentState';
+
 // ============================================================================
 // LLM Provider Types
 // ============================================================================
@@ -294,6 +296,8 @@ export interface ChatResponse {
     identityValidated: boolean;
     autoSaved: boolean;
     tokensUsed?: number;
+    constraintViolations?: ConstraintViolation[];
+    recoveredFromBlock?: boolean;
   };
 }
 
@@ -508,4 +512,12 @@ export type {
   ExplainRequest,
   ExplainResponse,
   AgentOperationalState,
+  ConstraintMode,
+  ConstraintMatchType,
+  Constraint,
+  CreateConstraintRequest,
+  UpdateConstraintRequest,
+  ConstraintViolation,
+  ConstraintCheckResult,
+  EnforcementLogEntry,
 } from './AgentState';

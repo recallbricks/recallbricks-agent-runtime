@@ -42,5 +42,15 @@ export {
   ConfigBuilder,
 } from './config';
 
+// Constraint types (re-exported from types)
+export type {
+  Constraint,
+  ConstraintCheckResult,
+  ConstraintViolation,
+  CreateConstraintRequest,
+  UpdateConstraintRequest,
+  EnforcementLogEntry,
+} from './types';
+
 // Types
 export * from './types';

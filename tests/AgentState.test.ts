@@ -679,3 +679,246 @@ describe('ReflectionEngine explainFromState', () => {
     expect(trace.conclusion).toContain('Use path Y instead');
   });
 });
+
+// ============================================================================
+// Confidence Calculation Tests (Phase 5)
+// ============================================================================
+
+describe('AutoSaver Confidence Calculation', () => {
+  let autoSaver: AutoSaver;
+  let mockAxiosInstance: any;
+
+  beforeEach(() => {
+    mockAxiosInstance = {
+      get: jest.fn().mockResolvedValue({ data: {} }),
+      post: jest.fn().mockResolvedValue({
+        data: { id: 'mem_123', text: 'test', user_id: 'u1', created_at: new Date().toISOString() },
+      }),
+      defaults: { headers: {} },
+      interceptors: { response: { use: jest.fn() } },
+    };
+    mockedAxios.create.mockReturnValue(mockAxiosInstance);
+    (mockedAxios.isAxiosError as unknown as jest.Mock) = jest.fn().mockReturnValue(false);
+
+    autoSaver = new AutoSaver({
+      apiUrl: 'https://api.test.com',
+      apiKey: 'test_key',
+      agentId: 'agent_001',
+      userId: 'user_001',
+      tier: 'starter',
+      logger: mockLogger,
+    });
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('should assign high confidence for successful outcomes', () => {
+    const turn: ConversationTurn = {
+      userMessage: 'Create a file',
+      assistantResponse: 'I created the file successfully.',
+      timestamp: new Date().toISOString(),
+    };
+
+    const entry = autoSaver.extractStateEntry(turn);
+    expect(entry.outcome).toBe('success');
+    expect(entry.confidence).toBe(0.8);
+  });
+
+  it('should assign low confidence for failure outcomes', () => {
+    const turn: ConversationTurn = {
+      userMessage: 'Deploy app',
+      assistantResponse: 'Unfortunately, I was unable to deploy the application.',
+      timestamp: new Date().toISOString(),
+    };
+
+    const entry = autoSaver.extractStateEntry(turn);
+    expect(entry.outcome).toBe('failure');
+    expect(entry.confidence).toBe(0.3);
+  });
+
+  it('should assign medium confidence for partial outcomes', () => {
+    const turn: ConversationTurn = {
+      userMessage: 'Update all files',
+      assistantResponse: 'I updated some files, however they were not fully completed due to issues.',
+      timestamp: new Date().toISOString(),
+    };
+
+    const entry = autoSaver.extractStateEntry(turn);
+    expect(entry.outcome).toBe('partial');
+    expect(entry.confidence).toBe(0.5);
+  });
+
+  it('should boost confidence when tools return results', () => {
+    const turn: ConversationTurn = {
+      userMessage: 'Search for records',
+      assistantResponse: 'Found 15 matching records.',
+      timestamp: new Date().toISOString(),
+    };
+
+    const entry = autoSaver.extractStateEntry(turn, {
+      toolsUsed: [{ name: 'search', result: 'Found 15 records' }],
+    });
+
+    expect(entry.confidence).toBe(0.9); // 0.8 (success) + 0.1 (tool results)
+  });
+
+  it('should penalize confidence when uncertainty is expressed', () => {
+    const turn: ConversationTurn = {
+      userMessage: 'What caused the issue?',
+      assistantResponse: 'I think the issue was caused by a network timeout, but I am not sure.',
+      timestamp: new Date().toISOString(),
+    };
+
+    const entry = autoSaver.extractStateEntry(turn);
+    expect(entry.confidence).toBeCloseTo(0.6, 5); // 0.8 (success) - 0.2 (uncertainty)
+  });
+
+  it('should clamp confidence to 0.0 minimum', () => {
+    const turn: ConversationTurn = {
+      userMessage: 'Fix the bug',
+      assistantResponse: 'Unfortunately I failed. I think it might be a permission issue but I am not sure.',
+      timestamp: new Date().toISOString(),
+    };
+
+    const entry = autoSaver.extractStateEntry(turn);
+    expect(entry.confidence).toBeCloseTo(0.1, 5); // 0.3 (failure) - 0.2 (uncertainty)
+  });
+});
+
+// ============================================================================
+// ContextWeaver Token Capping Tests (Phase 4)
+// ============================================================================
+
+describe('ContextWeaver State Token Capping', () => {
+  let contextWeaver: ContextWeaver;
+  let mockApiClient: jest.Mocked<RecallBricksClient>;
+
+  beforeEach(() => {
+    mockApiClient = new MockedRecallBricksClient({
+      apiUrl: 'https://api.test.com',
+      apiKey: 'test_key',
+      userId: 'test_user',
+    }) as jest.Mocked<RecallBricksClient>;
+
+    mockApiClient.recallMemories = jest.fn().mockResolvedValue({
+      memories: [],
+      total: 0,
+    });
+
+    contextWeaver = new ContextWeaver({
+      apiClient: mockApiClient,
+      agentId: 'agent_001',
+      agentName: 'TestBot',
+      agentPurpose: 'Testing',
+      maxContextMemories: 10,
+      maxContextTokens: 4000,
+      logger: mockLogger,
+    });
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('should trim goals when state context exceeds token limit', async () => {
+    // Create many goals to exceed 500 token limit
+    const entries: AgentStateEntry[] = [];
+    for (let i = 0; i < 50; i++) {
+      entries.push({
+        id: `state_${i}`,
+        agent_id: 'agent_001',
+        timestamp: new Date(Date.now() - i * 1000).toISOString(),
+        goal: `Goal number ${i}: a fairly long goal description that takes up space in the context`,
+        action: `action_${i}`,
+        reasoning: 'testing',
+        outcome: 'deferred' as const,
+        result_summary: 'Pending',
+        lesson: null,
+        constraint_discovered: null,
+        state_before: {},
+        state_after: {},
+        override: null,
+        recommendation: null,
+        confidence: 0.5,
+        superseded_by: null,
+        active: true,
+      });
+    }
+
+    mockApiClient.getAgentState = jest.fn().mockResolvedValue({
+      entries,
+      total: entries.length,
+    });
+
+    const ctx = await contextWeaver.buildStateContext();
+
+    // The prompt should still contain AGENT OPERATIONAL STATE
+    expect(ctx.systemPrompt).toContain('AGENT OPERATIONAL STATE');
+    // But should have fewer goals than the 50 we put in
+    const goalLines = (ctx.systemPrompt.match(/^- Goal number/gm) || []).length;
+    expect(goalLines).toBeLessThan(50);
+  });
+
+  it('should preserve directives and constraints during trimming', async () => {
+    const entries: AgentStateEntry[] = [];
+
+    // Add entries with directives and constraints
+    entries.push({
+      id: 'state_d',
+      agent_id: 'agent_001',
+      timestamp: new Date().toISOString(),
+      goal: 'important task',
+      action: 'action',
+      reasoning: 'reasoning',
+      outcome: 'success',
+      result_summary: 'done',
+      lesson: null,
+      constraint_discovered: 'must not call production API',
+      state_before: {},
+      state_after: {},
+      override: 'Do not retry path X',
+      recommendation: 'Use path Y',
+      confidence: 0.8,
+      superseded_by: null,
+      active: true,
+    });
+
+    // Add many filler entries to trigger trimming
+    for (let i = 0; i < 40; i++) {
+      entries.push({
+        id: `filler_${i}`,
+        agent_id: 'agent_001',
+        timestamp: new Date(Date.now() - (i + 1) * 1000).toISOString(),
+        goal: `filler goal ${i} with a long description to take up space`,
+        action: 'filler action',
+        reasoning: 'filler',
+        outcome: 'failure' as const,
+        result_summary: `Filler failure result summary for entry ${i}`,
+        lesson: `Filler lesson for entry ${i}`,
+        constraint_discovered: null,
+        state_before: {},
+        state_after: {},
+        override: null,
+        recommendation: null,
+        confidence: 0.3,
+        superseded_by: null,
+        active: true,
+      });
+    }
+
+    mockApiClient.getAgentState = jest.fn().mockResolvedValue({
+      entries,
+      total: entries.length,
+    });
+
+    const ctx = await contextWeaver.buildStateContext();
+
+    // Directives and constraints should always be preserved
+    expect(ctx.systemPrompt).toContain('must not call production API');
+    expect(ctx.systemPrompt).toContain('Do not retry path X');
+    expect(ctx.systemPrompt).toContain('Use path Y');
+  });
+});
+

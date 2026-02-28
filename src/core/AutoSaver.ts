@@ -187,7 +187,7 @@ Assistant: ${turn.assistantResponse}`;
     const action = this.extractAction(turn);
     const outcome = this.extractOutcome(turn);
     const reasoning = this.extractReasoning(turn);
-    const confidence = this.calculateHeuristicImportance(turn);
+    const confidence = this.calculateConfidence(turn, outcome);
 
     const entryId = `state_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
@@ -513,6 +513,51 @@ Assistant: ${turn.assistantResponse}`;
 
     this.extractionContext.sessionGoals = goals;
     return goals;
+  }
+
+  /**
+   * Calculate confidence based on outcome and response signals.
+   * Replaces the old calculateHeuristicImportance for state entries.
+   */
+  private calculateConfidence(turn: ConversationTurn, outcome: AgentStateOutcome): number {
+    // Base confidence from outcome
+    let confidence: number;
+    switch (outcome) {
+      case 'success': confidence = 0.8; break;
+      case 'failure': confidence = 0.3; break;
+      case 'partial': confidence = 0.5; break;
+      case 'deferred': confidence = 0.4; break;
+      case 'overridden': confidence = 0.6; break;
+      default: confidence = 0.5;
+    }
+
+    // Bonus: tools were used and returned results
+    if (this.extractionContext.toolsUsed?.length) {
+      const hasResults = this.extractionContext.toolsUsed.some(
+        t => t.result && !/error|fail|exception|denied/i.test(t.result)
+      );
+      if (hasResults) confidence += 0.1;
+    }
+
+    // Penalty: agent expressed uncertainty
+    const response = turn.assistantResponse.toLowerCase();
+    const uncertaintyPatterns = [
+      /\bi think\b/,
+      /\bprobably\b/,
+      /\bnot sure\b/,
+      /\bperhaps\b/,
+      /\bmight be\b/,
+      /\bnot certain\b/,
+    ];
+    for (const pattern of uncertaintyPatterns) {
+      if (pattern.test(response)) {
+        confidence -= 0.2;
+        break; // Apply penalty only once
+      }
+    }
+
+    // Clamp to 0.0 - 1.0
+    return Math.max(0, Math.min(1, confidence));
   }
 
   // ==========================================================================

@@ -42,6 +42,9 @@ describe('AgentRuntime', () => {
           created_at: new Date().toISOString(),
         },
       }),
+      patch: jest.fn().mockResolvedValue({
+        data: {},
+      }),
       defaults: { headers: {} },
       interceptors: {
         response: {
@@ -293,6 +296,207 @@ describe('AgentRuntime', () => {
 
       await runtime.shutdown();
       // Should complete without error
+    });
+  });
+
+  describe('recovery on block', () => {
+    it('should call LLM with recovery prompt when constraint blocks', async () => {
+      // Mock checkConstraints to return blocked on first POST to /check
+      let postCallCount = 0;
+      mockAxiosInstance.post.mockImplementation((url: string, _data: any) => {
+        postCallCount++;
+        if (url.includes('/constraints/') && url.includes('/check')) {
+          return Promise.resolve({
+            data: {
+              allowed: false,
+              violations: [{
+                constraint_id: 'c1',
+                constraint_text: 'Never call production API',
+                decision: 'blocked',
+                mode: 'enforce',
+              }],
+            },
+          });
+        }
+        // Default: memory/state saves
+        return Promise.resolve({
+          data: { id: 'mem_' + postCallCount, text: 'ok', created_at: new Date().toISOString() },
+        });
+      });
+
+      const runtime = new AgentRuntime({
+        agentId: 'test_agent',
+        userId: 'test_user',
+        agentName: 'TestBot',
+        llmProvider: 'anthropic',
+        llmApiKey: 'test_key',
+        apiKey: 'rb_test',
+        debug: true,
+        autoSave: false,
+      });
+
+      const response = await runtime.chat('Call the production API');
+
+      // Should have called the LLM for recovery (response comes from mocked Anthropic)
+      expect(response.response).toBeDefined();
+      expect(response.metadata.recoveredFromBlock).toBe(true);
+      expect(response.metadata.constraintViolations).toBeDefined();
+      expect(response.metadata.constraintViolations!.length).toBe(1);
+      expect(response.metadata.constraintViolations![0].constraint_text).toBe('Never call production API');
+    });
+
+    it('should return blocked response in MCP mode when no LLM available', async () => {
+      mockAxiosInstance.post.mockImplementation((url: string) => {
+        if (url.includes('/constraints/') && url.includes('/check')) {
+          return Promise.resolve({
+            data: {
+              allowed: false,
+              violations: [{
+                constraint_id: 'c1',
+                constraint_text: 'No deletions allowed',
+                decision: 'blocked',
+                mode: 'enforce',
+              }],
+            },
+          });
+        }
+        return Promise.resolve({
+          data: { id: 'mem_1', text: 'ok', created_at: new Date().toISOString() },
+        });
+      });
+
+      const runtime = new AgentRuntime({
+        agentId: 'test_agent',
+        userId: 'test_user',
+        agentName: 'TestBot',
+        mcpMode: true,
+        apiKey: 'rb_test',
+        debug: true,
+      });
+
+      const response = await runtime.chat('Delete everything');
+
+      expect(response.response).toContain('No deletions allowed');
+      expect(response.metadata.provider).toBe('none');
+      expect(response.metadata.constraintViolations).toBeDefined();
+      expect(response.metadata.recoveredFromBlock).toBeUndefined();
+    });
+  });
+
+  describe('constraint convenience methods', () => {
+    it('getConstraints should return constraints from API', async () => {
+      mockAxiosInstance.get.mockImplementation((url: string) => {
+        if (url.includes('/constraints/')) {
+          return Promise.resolve({
+            data: {
+              constraints: [
+                { id: 'c1', agent_id: 'test_agent', constraint_text: 'no prod', mode: 'enforce', active: true },
+              ],
+            },
+          });
+        }
+        return Promise.resolve({ data: { memories: [], total: 0 } });
+      });
+
+      const runtime = new AgentRuntime({
+        agentId: 'test_agent',
+        userId: 'test_user',
+        llmProvider: 'anthropic',
+        llmApiKey: 'test_key',
+        apiKey: 'rb_test',
+        debug: true,
+      });
+
+      const constraints = await runtime.getConstraints();
+      expect(constraints.length).toBe(1);
+      expect(constraints[0].constraint_text).toBe('no prod');
+    });
+
+    it('promoteConstraint should call updateConstraint with enforce mode', async () => {
+      mockAxiosInstance.patch.mockResolvedValueOnce({
+        data: { id: 'c1', mode: 'enforce', constraint_text: 'no prod', active: true },
+      });
+
+      const runtime = new AgentRuntime({
+        agentId: 'test_agent',
+        userId: 'test_user',
+        llmProvider: 'anthropic',
+        llmApiKey: 'test_key',
+        apiKey: 'rb_test',
+        debug: true,
+      });
+
+      const result = await runtime.promoteConstraint('c1');
+      expect(result.mode).toBe('enforce');
+      expect(mockAxiosInstance.patch).toHaveBeenCalledWith(
+        '/api/v1/constraints/c1',
+        { mode: 'enforce' }
+      );
+    });
+
+    it('getEnforcementLog should merge local and API entries', async () => {
+      mockAxiosInstance.get.mockImplementation((url: string) => {
+        if (url.includes('/enforcement/')) {
+          return Promise.resolve({
+            data: {
+              entries: [{
+                id: 'el1',
+                agent_id: 'test_agent',
+                constraint_id: 'c1',
+                proposed_action: 'delete db',
+                decision: 'blocked',
+                constraint_text: 'no deletions',
+                created_at: '2026-01-01T00:00:00Z',
+              }],
+            },
+          });
+        }
+        return Promise.resolve({ data: { memories: [], total: 0 } });
+      });
+
+      // First trigger a local enforcement entry via blocked constraint
+      mockAxiosInstance.post.mockImplementation((url: string) => {
+        if (url.includes('/constraints/') && url.includes('/check')) {
+          return Promise.resolve({
+            data: {
+              allowed: false,
+              violations: [{
+                constraint_id: 'c2',
+                constraint_text: 'no exec',
+                decision: 'blocked',
+                mode: 'enforce',
+              }],
+            },
+          });
+        }
+        return Promise.resolve({
+          data: { id: 'mem_1', text: 'ok', created_at: new Date().toISOString() },
+        });
+      });
+
+      const runtime = new AgentRuntime({
+        agentId: 'test_agent',
+        userId: 'test_user',
+        agentName: 'TestBot',
+        llmProvider: 'anthropic',
+        llmApiKey: 'test_key',
+        apiKey: 'rb_test',
+        debug: true,
+        autoSave: false,
+      });
+
+      // Trigger a blocked action to create a local enforcement entry
+      await runtime.chat('exec dangerous command');
+
+      const log = await runtime.getEnforcementLog();
+
+      // Should have both local (from chat) and API entries
+      expect(log.length).toBe(2);
+      // Local entry
+      expect(log[0].action).toContain('exec dangerous command');
+      // API entry
+      expect(log[1].action).toBe('delete db');
+      expect(log[1].timestamp).toBe('2026-01-01T00:00:00Z');
     });
   });
 });

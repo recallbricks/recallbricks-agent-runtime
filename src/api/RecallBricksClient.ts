@@ -16,6 +16,11 @@ import {
   GetAgentStateResponse,
   ExplainResponse,
   AgentStateOutcome,
+  Constraint,
+  CreateConstraintRequest,
+  UpdateConstraintRequest,
+  ConstraintCheckResult,
+  EnforcementLogEntry,
 } from '../types';
 
 // ============================================================================
@@ -323,6 +328,123 @@ export class RecallBricksClient {
       // Fallback: return empty trace
       this.logger?.warn('Explain endpoint not available');
       return { trace: '', entries_used: 0 };
+    }
+  }
+
+  // ==========================================================================
+  // Constraint Endpoints
+  // ==========================================================================
+
+  /**
+   * Get all active constraints for an agent
+   * GET /api/v1/constraints/:agentId
+   */
+  async getConstraints(
+    agentId: string,
+    options: { mode?: 'observe' | 'enforce' } = {}
+  ): Promise<Constraint[]> {
+    this.logger?.debug('Fetching constraints', { agentId, options });
+
+    try {
+      return await this.withRetry(async () => {
+        const params: Record<string, string> = {};
+        if (options.mode) params.mode = options.mode;
+
+        const response = await this.client.get<{ constraints: Constraint[] }>(
+          `/api/v1/constraints/${encodeURIComponent(agentId)}`,
+          { params }
+        );
+        return response.data.constraints ?? [];
+      });
+    } catch {
+      this.logger?.warn('Constraints endpoint not available');
+      return [];
+    }
+  }
+
+  /**
+   * Check proposed action against constraints
+   * POST /api/v1/constraints/:agentId/check
+   */
+  async checkConstraints(
+    agentId: string,
+    proposedAction: string,
+    goal?: string
+  ): Promise<ConstraintCheckResult> {
+    this.logger?.debug('Checking constraints', { agentId, proposedAction: proposedAction.slice(0, 50) });
+
+    try {
+      return await this.withRetry(async () => {
+        const response = await this.client.post<ConstraintCheckResult>(
+          `/api/v1/constraints/${encodeURIComponent(agentId)}/check`,
+          { proposed_action: proposedAction, goal }
+        );
+        return response.data;
+      });
+    } catch {
+      // Fail open: if constraint check API is unreachable, allow the action
+      this.logger?.warn('Constraint check endpoint not available, failing open');
+      return { allowed: true, violations: [] };
+    }
+  }
+
+  /**
+   * Create a new constraint
+   * POST /api/v1/constraints
+   */
+  async createConstraint(request: CreateConstraintRequest): Promise<Constraint> {
+    this.logger?.debug('Creating constraint', { agent_id: request.agent_id });
+
+    return this.withRetry(async () => {
+      const response = await this.client.post<Constraint>(
+        '/api/v1/constraints',
+        request
+      );
+      return response.data;
+    });
+  }
+
+  /**
+   * Update a constraint (e.g., promote observe → enforce)
+   * PATCH /api/v1/constraints/:id
+   */
+  async updateConstraint(id: string, updates: UpdateConstraintRequest): Promise<Constraint> {
+    this.logger?.debug('Updating constraint', { id, updates });
+
+    return this.withRetry(async () => {
+      const response = await this.client.patch<Constraint>(
+        `/api/v1/constraints/${encodeURIComponent(id)}`,
+        updates
+      );
+      return response.data;
+    });
+  }
+
+  /**
+   * Get enforcement audit log for an agent
+   * GET /api/v1/enforcement/:agentId
+   */
+  async getEnforcementLog(
+    agentId: string,
+    options: { limit?: number; decision?: 'blocked' | 'warned' } = {}
+  ): Promise<EnforcementLogEntry[]> {
+    this.logger?.debug('Fetching enforcement log', { agentId, options });
+
+    try {
+      return await this.withRetry(async () => {
+        const params: Record<string, string | number> = {};
+        if (options.limit) params.limit = options.limit;
+        if (options.decision) params.decision = options.decision;
+
+        const response = await this.client.get<{ entries: EnforcementLogEntry[] }>(
+          `/api/v1/enforcement/${encodeURIComponent(agentId)}`,
+          { params }
+        );
+        return response.data.entries ?? [];
+      });
+    } catch {
+      this.logger?.warn('Enforcement log endpoint not available');
+      return [];
     }
   }
 

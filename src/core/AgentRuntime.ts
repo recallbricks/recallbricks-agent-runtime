@@ -22,6 +22,8 @@ import {
   GoalTrackingResult,
   MetacognitionAssessment,
   AgentStateEntry,
+  Constraint,
+  ConstraintCheckResult,
 } from '../types';
 import { buildConfigFromOptions, createLogger } from '../config';
 import { LLMAdapter } from './LLMAdapter';
@@ -60,6 +62,11 @@ export class AgentRuntime {
   private previousTurn?: ConversationTurn;
   private conversationHistory: LLMMessage[] = [];
   private interactionCount = 0;
+  private enforcementLog: Array<{
+    timestamp: string;
+    action: string;
+    result: ConstraintCheckResult;
+  }> = [];
 
   // Autonomous agent clients
   public readonly workingMemory: WorkingMemoryClient;
@@ -427,6 +434,128 @@ export class AgentRuntime {
           autoCorrect: true,
           logger: this.logger,
         });
+      }
+
+      // Step 3a: Pre-execution constraint enforcement check
+      const currentGoal = this.stateContext?.operationalState?.activeGoals?.[0];
+      let constraintResult: ConstraintCheckResult | undefined;
+      try {
+        constraintResult = await this.apiClient.checkConstraints(
+          this.config.agentId,
+          message,
+          currentGoal
+        );
+      } catch {
+        // Fail open: if constraint check fails, allow the action
+        this.logger.warn('Constraint enforcement check failed, failing open');
+      }
+
+      if (constraintResult && constraintResult.violations) {
+        // Log enforcement decision
+        if (constraintResult.violations.length > 0) {
+          this.enforcementLog.push({
+            timestamp: new Date().toISOString(),
+            action: message.slice(0, 200),
+            result: constraintResult,
+          });
+        }
+
+        // If blocked by enforce-mode constraint, attempt recovery re-plan
+        if (!constraintResult.allowed) {
+          this.logger.warn('Action blocked by constraint enforcement', {
+            violations: constraintResult.violations.length,
+          });
+
+          const blockedViolations = constraintResult.violations.filter(
+            v => v.decision === 'blocked'
+          );
+          const constraintTexts = blockedViolations.map(v => v.constraint_text).join('; ');
+
+          // Record the blocked attempt as a state entry
+          const blockedTurn: ConversationTurn = {
+            userMessage: message,
+            assistantResponse: `[BLOCKED] Action blocked by constraints: ${constraintTexts}`,
+            timestamp: new Date().toISOString(),
+          };
+          this.autoSaver.saveStateEntry(blockedTurn).catch((err) => {
+            this.logger.warn('Failed to save blocked state entry', { error: (err as Error).message });
+          });
+
+          // If no LLM adapter (MCP mode), cannot recover — return blocked
+          if (!this.llmAdapter) {
+            return {
+              response: `Action blocked by ${blockedViolations.length} enforced constraint(s):\n` +
+                blockedViolations.map(v => `- ${v.constraint_text}`).join('\n'),
+              metadata: {
+                provider: 'none' as LLMProvider,
+                model: 'enforcement',
+                contextLoaded: true,
+                identityValidated: false,
+                autoSaved: false,
+                tokensUsed: 0,
+                constraintViolations: constraintResult.violations,
+              },
+            };
+          }
+
+          // Recovery: ask LLM for an alternative approach (one retry, no loops)
+          const recoveryPrompt =
+            `The user asked: "${message}"\n\n` +
+            `Your proposed action was blocked. Constraint: ${constraintTexts}. ` +
+            `Please provide an alternative approach that does not violate this constraint.`;
+
+          this.logger.info('Attempting recovery re-plan after constraint block');
+          const recoveryMessages = this.buildEnrichedMessages(recoveryPrompt, conversationHistory);
+          const recoveryLLMResponse = await this.llmAdapter.chat(recoveryMessages);
+
+          // Record recovery as a state entry
+          const recoveryTurn: ConversationTurn = {
+            userMessage: recoveryPrompt,
+            assistantResponse: recoveryLLMResponse.content,
+            timestamp: new Date().toISOString(),
+          };
+          this.autoSaver.saveStateEntry(recoveryTurn).catch((err) => {
+            this.logger.warn('Failed to save recovery state entry', { error: (err as Error).message });
+          });
+
+          // Store as previous turn and update history
+          this.previousTurn = {
+            userMessage: message,
+            assistantResponse: recoveryLLMResponse.content,
+            timestamp: new Date().toISOString(),
+          };
+          this.conversationHistory.push(
+            { role: 'user', content: message },
+            { role: 'assistant', content: recoveryLLMResponse.content }
+          );
+
+          const duration = Date.now() - startTime;
+          this.logger.info('Recovery re-plan completed', { duration: `${duration}ms` });
+
+          return {
+            response: recoveryLLMResponse.content,
+            metadata: {
+              provider: recoveryLLMResponse.provider,
+              model: recoveryLLMResponse.model,
+              contextLoaded: true,
+              identityValidated: false,
+              autoSaved: this.config.autoSave!,
+              tokensUsed: recoveryLLMResponse.usage?.totalTokens,
+              constraintViolations: constraintResult.violations,
+              recoveredFromBlock: true,
+            },
+          };
+        }
+
+        // If observe-mode violations, attach to the extraction context for state entry
+        if (constraintResult.violations.length > 0) {
+          this.logger.info('Observed constraint violations (non-blocking)', {
+            count: constraintResult.violations.length,
+          });
+          this.autoSaver.updateExtractionContext({
+            reflectionOutput: `Observed constraint violations: ${constraintResult.violations.map(v => v.constraint_text).join('; ')}`,
+          });
+        }
       }
 
       // In MCP mode, return context without calling LLM
@@ -853,5 +982,88 @@ export class AgentRuntime {
   async assessResponse(response: string, confidence: number): Promise<MetacognitionAssessment> {
     this.logger.debug('Assessing response with metacognition', { confidence });
     return this.metacognition.assessResponse(response, confidence);
+  }
+
+  // ============================================================================
+  // Constraint Enforcement Methods
+  // ============================================================================
+
+  /**
+   * Add a constraint for this agent
+   *
+   * @param text - The constraint text (what should be restricted)
+   * @param options - Optional configuration for the constraint
+   * @returns The created Constraint
+   */
+  async addConstraint(
+    text: string,
+    options?: { mode?: 'observe' | 'enforce'; matchPattern?: string; matchType?: 'contains' | 'regex' | 'tool_name' | 'exact' }
+  ): Promise<Constraint> {
+    this.logger.info('Adding constraint', { text: text.slice(0, 50), mode: options?.mode || 'observe' });
+
+    return this.apiClient.createConstraint({
+      agent_id: this.config.agentId,
+      constraint_text: text,
+      mode: options?.mode,
+      match_pattern: options?.matchPattern,
+      match_type: options?.matchType,
+    });
+  }
+
+  /**
+   * Get active constraints for this agent
+   *
+   * @returns Array of active Constraint objects
+   */
+  async getConstraints(): Promise<Constraint[]> {
+    return this.apiClient.getConstraints(this.config.agentId);
+  }
+
+  /**
+   * Promote a constraint from observe mode to enforce mode
+   *
+   * @param id - The constraint ID to promote
+   * @returns The updated Constraint
+   */
+  async promoteConstraint(id: string): Promise<Constraint> {
+    this.logger.info('Promoting constraint to enforce mode', { id });
+    return this.apiClient.updateConstraint(id, { mode: 'enforce' });
+  }
+
+  /**
+   * Get enforcement decisions for this agent (local + API)
+   *
+   * @returns Array of local enforcement log entries plus API entries if available
+   */
+  async getEnforcementLog(): Promise<Array<{
+    timestamp: string;
+    action: string;
+    result: ConstraintCheckResult;
+  }>> {
+    // Merge local log with API enforcement log
+    const local = [...this.enforcementLog];
+
+    try {
+      const apiEntries = await this.apiClient.getEnforcementLog(this.config.agentId);
+      for (const entry of apiEntries) {
+        local.push({
+          timestamp: entry.created_at,
+          action: entry.proposed_action,
+          result: {
+            allowed: entry.decision !== 'blocked',
+            violations: [{
+              constraint_id: entry.constraint_id,
+              constraint_text: entry.constraint_text,
+              decision: entry.decision,
+              mode: entry.decision === 'blocked' ? 'enforce' : 'observe',
+            }],
+          },
+        });
+      }
+    } catch {
+      this.logger.debug('Could not fetch API enforcement log');
+    }
+
+    return local;
   }
 }

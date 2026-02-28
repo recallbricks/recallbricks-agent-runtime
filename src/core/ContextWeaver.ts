@@ -152,7 +152,9 @@ export class ContextWeaver {
     // 3. Build operational state
     const operationalState = this.buildOperationalState(entries);
 
-    // 4. Format as system prompt
+    // 4. Format as system prompt with token cap
+    const maxStateTokens = 500;
+    this.trimOperationalState(operationalState, maxStateTokens);
     const statePrompt = this.formatStateSystemPrompt(this.identity, operationalState);
 
     const stateContext: StateContext = {
@@ -233,6 +235,64 @@ export class ContextWeaver {
       directives,
       currentState,
     };
+  }
+
+  /**
+   * Trim operational state to fit within a token budget.
+   * Priority (never cut → cut first):
+   *   1. Directives (never cut)
+   *   2. Constraints (never cut)
+   *   3. Failures (cut oldest first)
+   *   4. Goals (cut oldest first)
+   *   5. System state keys (cut excess)
+   */
+  private trimOperationalState(
+    state: AgentOperationalState,
+    maxTokens: number
+  ): void {
+    const estimate = () => {
+      // Rough estimate of how many tokens the state section will use
+      let chars = 30; // "AGENT OPERATIONAL STATE:\n"
+      chars += state.activeGoals.reduce((s, g) => s + g.length + 4, 20);
+      chars += state.activeConstraints.reduce((s, c) => s + c.length + 4, 0);
+      chars += state.recentFailures.reduce(
+        (s, f) => s + f.goal.length + f.action.length + f.result_summary.length + (f.lesson?.length ?? 0) + 40,
+        0
+      );
+      chars += state.directives.reduce((s, d) => s + d.content.length + 20, 0);
+      chars += Object.keys(state.currentState).slice(0, 20).reduce(
+        (s, k) => s + k.length + JSON.stringify(state.currentState[k]).length + 6,
+        0
+      );
+      return Math.ceil(chars / 4);
+    };
+
+    let tokens = estimate();
+    if (tokens <= maxTokens) return;
+
+    // Cut system state keys first
+    const stateKeys = Object.keys(state.currentState);
+    while (stateKeys.length > 2 && estimate() > maxTokens) {
+      const key = stateKeys.pop()!;
+      delete state.currentState[key];
+    }
+
+    // Cut goals oldest first (end of array)
+    while (state.activeGoals.length > 1 && estimate() > maxTokens) {
+      state.activeGoals.pop();
+    }
+
+    // Cut oldest failures
+    while (state.recentFailures.length > 1 && estimate() > maxTokens) {
+      state.recentFailures.shift();
+    }
+
+    if (estimate() > maxTokens) {
+      this.config.logger.warn('State context exceeds token limit after trimming', {
+        estimatedTokens: estimate(),
+        maxTokens,
+      });
+    }
   }
 
   /**

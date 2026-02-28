@@ -85,6 +85,67 @@ export interface ExplainResponse {
 }
 
 // ============================================================================
+// Constraint Types
+// ============================================================================
+
+export type ConstraintMode = 'observe' | 'enforce';
+export type ConstraintMatchType = 'contains' | 'regex' | 'tool_name' | 'exact';
+
+export interface Constraint {
+  id: string;
+  agent_id: string;
+  constraint_text: string;
+  mode: ConstraintMode;
+  match_pattern: string | null;
+  match_type: ConstraintMatchType;
+  scope: string;
+  active: boolean;
+  source: string | null;
+  source_state_id: string | null;
+  times_triggered: number;
+  last_triggered_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateConstraintRequest {
+  agent_id: string;
+  constraint_text: string;
+  mode?: ConstraintMode;
+  match_pattern?: string;
+  match_type?: ConstraintMatchType;
+  scope?: string;
+}
+
+export interface UpdateConstraintRequest {
+  mode?: ConstraintMode;
+  active?: boolean;
+  match_pattern?: string;
+}
+
+export interface ConstraintViolation {
+  constraint_id: string;
+  constraint_text: string;
+  decision: 'blocked' | 'warned';
+  mode: ConstraintMode;
+}
+
+export interface ConstraintCheckResult {
+  allowed: boolean;
+  violations: ConstraintViolation[];
+}
+
+export interface EnforcementLogEntry {
+  id: string;
+  agent_id: string;
+  constraint_id: string;
+  proposed_action: string;
+  decision: 'blocked' | 'warned';
+  constraint_text: string;
+  created_at: string;
+}
+
+// ============================================================================
 // State context formatted for system prompt injection
 // ============================================================================
 
