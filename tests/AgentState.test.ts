@@ -5,7 +5,8 @@
  * - State extraction from conversation turns (AutoSaver)
  * - Deterministic state context loading (ContextWeaver)
  * - Explain from state entries (ReflectionEngine)
- * - State API client methods (RecallBricksClient)
+ * - CaptureMode behavior
+ * - Explicit reporting methods
  */
 
 import { AutoSaver } from '../src/core/AutoSaver';
@@ -13,11 +14,8 @@ import { ContextWeaver } from '../src/core/ContextWeaver';
 import { ReflectionEngine } from '../src/core/ReflectionEngine';
 import { RecallBricksClient } from '../src/api/RecallBricksClient';
 import { ConversationTurn, Logger, AgentStateEntry } from '../src/types';
-import axios from 'axios';
-
 // Mock axios
 jest.mock('axios');
-const mockedAxios = axios as jest.Mocked<typeof axios>;
 
 // Mock RecallBricksClient
 jest.mock('../src/api/RecallBricksClient');
@@ -39,20 +37,8 @@ const mockLogger: Logger = {
 
 describe('AutoSaver State Extraction', () => {
   let autoSaver: AutoSaver;
-  let mockAxiosInstance: any;
 
   beforeEach(() => {
-    mockAxiosInstance = {
-      get: jest.fn().mockResolvedValue({ data: {} }),
-      post: jest.fn().mockResolvedValue({
-        data: { id: 'mem_123', text: 'test', user_id: 'u1', created_at: new Date().toISOString() },
-      }),
-      defaults: { headers: {} },
-      interceptors: { response: { use: jest.fn() } },
-    };
-    mockedAxios.create.mockReturnValue(mockAxiosInstance);
-    (mockedAxios.isAxiosError as unknown as jest.Mock) = jest.fn().mockReturnValue(false);
-
     autoSaver = new AutoSaver({
       apiUrl: 'https://api.test.com',
       apiKey: 'test_key',
@@ -60,6 +46,7 @@ describe('AutoSaver State Extraction', () => {
       userId: 'user_001',
       tier: 'starter',
       logger: mockLogger,
+      captureMode: 'auto',
     });
   });
 
@@ -84,8 +71,8 @@ describe('AutoSaver State Extraction', () => {
       expect(entry.id).toMatch(/^state_/);
       expect(entry.goal).toBeTruthy();
       expect(entry.action).toBeTruthy();
-      expect(entry.result_summary).toBeTruthy();
-      expect(entry.confidence).toBeGreaterThan(0);
+      expect(entry.result).toBeTruthy();
+      expect(entry.source).toBe('auto');
     });
 
     it('should detect failure outcome', () => {
@@ -98,55 +85,19 @@ describe('AutoSaver State Extraction', () => {
       const entry = autoSaver.extractStateEntry(turn);
 
       expect(entry.outcome).toBe('failure');
-      expect(entry.lesson).toBeTruthy(); // Should extract a lesson from failure
+      expect(entry.lesson).toBeTruthy();
     });
 
-    it('should detect partial outcome', () => {
+    it('should detect blocked outcome', () => {
       const turn: ConversationTurn = {
-        userMessage: 'Update all dependencies',
-        assistantResponse: 'I updated most dependencies, however some issues remain. Not fully completed due to version conflicts.',
+        userMessage: 'Call the production API',
+        assistantResponse: '[BLOCKED] Action blocked by constraints: Never call production API',
         timestamp: new Date().toISOString(),
       };
 
       const entry = autoSaver.extractStateEntry(turn);
 
-      expect(entry.outcome).toBe('partial');
-    });
-
-    it('should detect deferred outcome', () => {
-      const turn: ConversationTurn = {
-        userMessage: 'Configure the database',
-        assistantResponse: 'I need more information to proceed. Could you clarify which database engine to use?',
-        timestamp: new Date().toISOString(),
-      };
-
-      const entry = autoSaver.extractStateEntry(turn);
-
-      expect(entry.outcome).toBe('deferred');
-    });
-
-    it('should extract constraints from responses', () => {
-      const turn: ConversationTurn = {
-        userMessage: 'Access the admin panel',
-        assistantResponse: 'I cannot access the admin panel due to insufficient permissions. This requires admin-level access.',
-        timestamp: new Date().toISOString(),
-      };
-
-      const entry = autoSaver.extractStateEntry(turn);
-
-      expect(entry.constraint_discovered).toBeTruthy();
-    });
-
-    it('should extract recommendations from responses', () => {
-      const turn: ConversationTurn = {
-        userMessage: 'How should I structure the API?',
-        assistantResponse: 'I recommend using a RESTful design with versioned endpoints for better maintainability.',
-        timestamp: new Date().toISOString(),
-      };
-
-      const entry = autoSaver.extractStateEntry(turn);
-
-      expect(entry.recommendation).toBeTruthy();
+      expect(entry.outcome).toBe('blocked');
     });
 
     it('should use tool context when provided', () => {
@@ -162,6 +113,7 @@ describe('AutoSaver State Extraction', () => {
 
       expect(entry.action).toContain('tool:database_search');
       expect(entry.outcome).toBe('success');
+      expect(entry.tool_name).toBe('database_search');
     });
 
     it('should detect tool failures', () => {
@@ -178,37 +130,33 @@ describe('AutoSaver State Extraction', () => {
       expect(entry.outcome).toBe('failure');
     });
 
-    it('should use reflection output as reasoning', () => {
+    it('should generate failure_signature for failures', () => {
       const turn: ConversationTurn = {
-        userMessage: 'Analyze this data',
-        assistantResponse: 'The analysis shows a clear trend.',
+        userMessage: 'Call the API',
+        assistantResponse: 'The API call failed with error: connection refused.',
+        timestamp: new Date().toISOString(),
+      };
+
+      const entry = autoSaver.extractStateEntry(turn);
+
+      expect(entry.outcome).toBe('failure');
+      expect(entry.failure_signature).toBeTruthy();
+      expect(entry.seen_count).toBe(1);
+      expect(entry.first_seen_at).toBeTruthy();
+    });
+
+    it('should extract error_code from tool results', () => {
+      const turn: ConversationTurn = {
+        userMessage: 'Send request',
+        assistantResponse: 'Request failed.',
         timestamp: new Date().toISOString(),
       };
 
       const entry = autoSaver.extractStateEntry(turn, {
-        reflectionOutput: 'Previous attempts showed the data has seasonal patterns',
+        toolsUsed: [{ name: 'http_client', result: 'error: 429 rate limited' }],
       });
 
-      expect(entry.reasoning).toContain('seasonal patterns');
-    });
-
-    it('should increment turn number', () => {
-      const turn1: ConversationTurn = {
-        userMessage: 'First message',
-        assistantResponse: 'First response',
-        timestamp: new Date().toISOString(),
-      };
-      const turn2: ConversationTurn = {
-        userMessage: 'Second message',
-        assistantResponse: 'Second response',
-        timestamp: new Date().toISOString(),
-      };
-
-      const entry1 = autoSaver.extractStateEntry(turn1);
-      const entry2 = autoSaver.extractStateEntry(turn2);
-
-      expect((entry1.state_before as Record<string, number>).turn_number).toBe(0);
-      expect((entry2.state_before as Record<string, number>).turn_number).toBe(1);
+      expect(entry.error_code).toBe('429');
     });
   });
 
@@ -269,7 +217,6 @@ describe('AutoSaver State Extraction', () => {
       autoSaver.extractStateEntry(turn2);
 
       const active = autoSaver.getActiveStateEntries();
-      // The second entry supersedes the first — only one should be active
       expect(active.length).toBe(1);
     });
   });
@@ -287,9 +234,100 @@ describe('AutoSaver State Extraction', () => {
       };
 
       const entry = autoSaver.extractStateEntry(turn);
-      const stateBefore = entry.state_before as Record<string, string[]>;
-      expect(stateBefore.active_goals).toContain('build API');
+      expect(entry).toBeDefined();
+      expect(entry.outcome).toBe('success');
     });
+  });
+});
+
+// ============================================================================
+// CaptureMode Tests
+// ============================================================================
+
+describe('AutoSaver CaptureMode', () => {
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('captureMode=tools should only capture on error signals', () => {
+    const autoSaver = new AutoSaver({
+      apiUrl: 'https://api.test.com',
+      apiKey: 'test_key',
+      agentId: 'agent_001',
+      userId: 'user_001',
+      tier: 'starter',
+      logger: mockLogger,
+      captureMode: 'tools',
+    });
+
+    // Normal turn without error signals — should create minimal success entry
+    const normalTurn: ConversationTurn = {
+      userMessage: 'Hello',
+      assistantResponse: 'Hi there! How can I help?',
+      timestamp: new Date().toISOString(),
+    };
+
+    const normalEntry = autoSaver.extractStateEntry(normalTurn);
+    expect(normalEntry.outcome).toBe('success');
+    expect(normalEntry.source).toBe('auto');
+
+    // Turn with error signal — should capture with full extraction
+    const errorTurn: ConversationTurn = {
+      userMessage: 'Call the API',
+      assistantResponse: '[ERROR] HTTP 500 internal server error',
+      timestamp: new Date().toISOString(),
+    };
+
+    const errorEntry = autoSaver.extractStateEntry(errorTurn);
+    expect(errorEntry.outcome).toBeDefined();
+    // Error signal detected, so full extraction runs
+    expect(errorEntry.result).toBeTruthy();
+  });
+
+  it('captureMode=off should create minimal entries', () => {
+    const autoSaver = new AutoSaver({
+      apiUrl: 'https://api.test.com',
+      apiKey: 'test_key',
+      agentId: 'agent_001',
+      userId: 'user_001',
+      tier: 'starter',
+      logger: mockLogger,
+      captureMode: 'off',
+    });
+
+    const turn: ConversationTurn = {
+      userMessage: 'Deploy the application',
+      assistantResponse: 'Unfortunately, I was unable to deploy.',
+      timestamp: new Date().toISOString(),
+    };
+
+    const entry = autoSaver.extractStateEntry(turn);
+    expect(entry.outcome).toBe('success'); // 'off' mode always returns success
+    expect(entry.action).toBe('generated response');
+    expect(entry.source).toBe('auto');
+  });
+
+  it('captureMode=auto should use full heuristic extraction', () => {
+    const autoSaver = new AutoSaver({
+      apiUrl: 'https://api.test.com',
+      apiKey: 'test_key',
+      agentId: 'agent_001',
+      userId: 'user_001',
+      tier: 'starter',
+      logger: mockLogger,
+      captureMode: 'auto',
+    });
+
+    const turn: ConversationTurn = {
+      userMessage: 'Deploy the application',
+      assistantResponse: 'Unfortunately, I was unable to deploy. The server returned an error.',
+      timestamp: new Date().toISOString(),
+    };
+
+    const entry = autoSaver.extractStateEntry(turn);
+    expect(entry.outcome).toBe('failure');
+    expect(entry.lesson).toBeTruthy();
+    expect(entry.result).toBeTruthy();
   });
 });
 
@@ -316,17 +354,9 @@ describe('ContextWeaver State Context', () => {
           timestamp: new Date().toISOString(),
           goal: 'build API',
           action: 'created endpoint',
-          reasoning: 'user requested REST API',
           outcome: 'success',
-          result_summary: 'API endpoint created',
-          lesson: null,
-          constraint_discovered: null,
-          state_before: {},
-          state_after: { endpoints: 3 },
-          override: null,
-          recommendation: 'add authentication next',
-          confidence: 0.8,
-          superseded_by: null,
+          result: 'API endpoint created',
+          tool_name: 'code_gen',
           active: true,
         },
         {
@@ -335,17 +365,11 @@ describe('ContextWeaver State Context', () => {
           timestamp: new Date(Date.now() - 10000).toISOString(),
           goal: 'deploy to prod',
           action: 'attempted deployment',
-          reasoning: 'deployment requested',
           outcome: 'failure',
-          result_summary: 'Deployment failed: missing env vars',
+          result: 'Deployment failed: missing env vars',
+          tool_name: 'deploy_tool',
           lesson: 'Always check env vars before deployment',
-          constraint_discovered: 'requires ENV_SECRET to be set',
-          state_before: {},
-          state_after: {},
-          override: null,
-          recommendation: null,
-          confidence: 0.6,
-          superseded_by: null,
+          created_constraint: 'requires ENV_SECRET to be set',
           active: true,
         },
       ] as AgentStateEntry[],
@@ -384,25 +408,26 @@ describe('ContextWeaver State Context', () => {
       expect(ctx.systemPrompt).toContain('AGENT OPERATIONAL STATE');
     });
 
-    it('should include discovered constraints', async () => {
+    it('should include created constraints', async () => {
       const ctx = await contextWeaver.buildStateContext();
 
       expect(ctx.operationalState.activeConstraints).toContain('requires ENV_SECRET to be set');
       expect(ctx.systemPrompt).toContain('Active constraints');
     });
 
-    it('should include recent failures with lessons', async () => {
+    it('should include recent failures with lessons and tool_name', async () => {
       const ctx = await contextWeaver.buildStateContext();
 
       expect(ctx.operationalState.recentFailures.length).toBe(1);
       expect(ctx.operationalState.recentFailures[0].lesson).toContain('env vars');
+      expect(ctx.operationalState.recentFailures[0].tool_name).toBe('deploy_tool');
     });
 
-    it('should include directives (recommendations)', async () => {
+    it('should format failures with tool_name in system prompt', async () => {
       const ctx = await contextWeaver.buildStateContext();
 
-      expect(ctx.operationalState.directives.length).toBeGreaterThan(0);
-      expect(ctx.operationalState.directives[0].content).toContain('authentication');
+      // With tool_name, format is: "Failure: deploy_tool returned ..."
+      expect(ctx.systemPrompt).toContain('deploy_tool');
     });
 
     it('should merge local entries with API entries', async () => {
@@ -412,17 +437,8 @@ describe('ContextWeaver State Context', () => {
         timestamp: new Date().toISOString(),
         goal: 'local task',
         action: 'local action',
-        reasoning: 'local reasoning',
         outcome: 'success',
-        result_summary: 'done locally',
-        lesson: null,
-        constraint_discovered: null,
-        state_before: {},
-        state_after: {},
-        override: null,
-        recommendation: null,
-        confidence: 0.7,
-        superseded_by: null,
+        result: 'done locally',
         active: true,
       };
 
@@ -438,23 +454,13 @@ describe('ContextWeaver State Context', () => {
         timestamp: new Date().toISOString(),
         goal: 'build API',
         action: 'created endpoint',
-        reasoning: 'duplicate',
         outcome: 'success',
-        result_summary: 'duplicate',
-        lesson: null,
-        constraint_discovered: null,
-        state_before: {},
-        state_after: {},
-        override: null,
-        recommendation: null,
-        confidence: 0.8,
-        superseded_by: null,
+        result: 'duplicate',
         active: true,
       };
 
       const ctx = await contextWeaver.buildStateContext([duplicateEntry]);
 
-      // Should not add duplicate
       expect(ctx.stateEntries.length).toBe(2);
     });
 
@@ -467,17 +473,8 @@ describe('ContextWeaver State Context', () => {
         timestamp: new Date().toISOString(),
         goal: 'offline task',
         action: 'offline action',
-        reasoning: 'offline reasoning',
         outcome: 'success',
-        result_summary: 'done offline',
-        lesson: null,
-        constraint_discovered: null,
-        state_before: {},
-        state_after: {},
-        override: null,
-        recommendation: null,
-        confidence: 0.5,
-        superseded_by: null,
+        result: 'done offline',
         active: true,
       };
 
@@ -566,17 +563,10 @@ describe('ReflectionEngine explainFromState', () => {
         timestamp: new Date(Date.now() - 20000).toISOString(),
         goal: 'deploy to prod',
         action: 'ran deploy command',
-        reasoning: 'user requested deployment',
         outcome: 'failure',
-        result_summary: 'Missing environment variables',
+        result: 'Missing environment variables',
+        tool_name: 'deploy_cli',
         lesson: 'Always verify env vars first',
-        constraint_discovered: 'requires PROD_KEY',
-        state_before: {},
-        state_after: {},
-        override: null,
-        recommendation: 'check env vars before next attempt',
-        confidence: 0.5,
-        superseded_by: null,
         active: true,
       },
       {
@@ -585,17 +575,8 @@ describe('ReflectionEngine explainFromState', () => {
         timestamp: new Date().toISOString(),
         goal: 'deploy to prod',
         action: 'ran deploy command with env vars',
-        reasoning: 'retry with correct config',
         outcome: 'success',
-        result_summary: 'Deployment successful',
-        lesson: null,
-        constraint_discovered: null,
-        state_before: {},
-        state_after: { deployed: true },
-        override: null,
-        recommendation: null,
-        confidence: 0.9,
-        superseded_by: null,
+        result: 'Deployment successful',
         active: true,
       },
     ];
@@ -605,6 +586,7 @@ describe('ReflectionEngine explainFromState', () => {
     expect(trace.query).toBe('Why did deployment fail initially?');
     expect(trace.steps.length).toBe(2);
     expect(trace.steps[0].thought).toContain('deploy to prod');
+    expect(trace.steps[0].thought).toContain('deploy_cli');
     expect(trace.steps[0].observation).toContain('failure');
     expect(trace.steps[0].action).toContain('Always verify env vars');
     expect(trace.conclusion).toBeTruthy();
@@ -629,17 +611,9 @@ describe('ReflectionEngine explainFromState', () => {
         timestamp: new Date().toISOString(),
         goal: 'parse CSV file',
         action: 'attempted CSV parsing',
-        reasoning: 'user uploaded CSV',
         outcome: 'failure',
-        result_summary: 'Invalid encoding detected',
+        result: 'Invalid encoding detected',
         lesson: 'Check file encoding before parsing',
-        constraint_discovered: null,
-        state_before: {},
-        state_after: {},
-        override: null,
-        recommendation: 'try UTF-8 conversion first',
-        confidence: 0.4,
-        superseded_by: null,
         active: true,
       },
     ];
@@ -649,146 +623,10 @@ describe('ReflectionEngine explainFromState', () => {
     expect(trace.conclusion).toContain('parse CSV file');
     expect(trace.conclusion).toContain('Check file encoding');
   });
-
-  it('should include directives in conclusion', () => {
-    const entries: AgentStateEntry[] = [
-      {
-        id: 'state_d',
-        agent_id: 'agent_001',
-        timestamp: new Date().toISOString(),
-        goal: 'handle request',
-        action: 'processed request',
-        reasoning: 'standard processing',
-        outcome: 'success',
-        result_summary: 'Done',
-        lesson: null,
-        constraint_discovered: null,
-        state_before: {},
-        state_after: {},
-        override: 'Do not retry path X',
-        recommendation: 'Use path Y instead',
-        confidence: 0.8,
-        superseded_by: null,
-        active: true,
-      },
-    ];
-
-    const trace = reflectionEngine.explainFromState('What should I do?', entries);
-
-    expect(trace.conclusion).toContain('Do not retry path X');
-    expect(trace.conclusion).toContain('Use path Y instead');
-  });
 });
 
 // ============================================================================
-// Confidence Calculation Tests (Phase 5)
-// ============================================================================
-
-describe('AutoSaver Confidence Calculation', () => {
-  let autoSaver: AutoSaver;
-  let mockAxiosInstance: any;
-
-  beforeEach(() => {
-    mockAxiosInstance = {
-      get: jest.fn().mockResolvedValue({ data: {} }),
-      post: jest.fn().mockResolvedValue({
-        data: { id: 'mem_123', text: 'test', user_id: 'u1', created_at: new Date().toISOString() },
-      }),
-      defaults: { headers: {} },
-      interceptors: { response: { use: jest.fn() } },
-    };
-    mockedAxios.create.mockReturnValue(mockAxiosInstance);
-    (mockedAxios.isAxiosError as unknown as jest.Mock) = jest.fn().mockReturnValue(false);
-
-    autoSaver = new AutoSaver({
-      apiUrl: 'https://api.test.com',
-      apiKey: 'test_key',
-      agentId: 'agent_001',
-      userId: 'user_001',
-      tier: 'starter',
-      logger: mockLogger,
-    });
-  });
-
-  afterEach(() => {
-    jest.clearAllMocks();
-  });
-
-  it('should assign high confidence for successful outcomes', () => {
-    const turn: ConversationTurn = {
-      userMessage: 'Create a file',
-      assistantResponse: 'I created the file successfully.',
-      timestamp: new Date().toISOString(),
-    };
-
-    const entry = autoSaver.extractStateEntry(turn);
-    expect(entry.outcome).toBe('success');
-    expect(entry.confidence).toBe(0.8);
-  });
-
-  it('should assign low confidence for failure outcomes', () => {
-    const turn: ConversationTurn = {
-      userMessage: 'Deploy app',
-      assistantResponse: 'Unfortunately, I was unable to deploy the application.',
-      timestamp: new Date().toISOString(),
-    };
-
-    const entry = autoSaver.extractStateEntry(turn);
-    expect(entry.outcome).toBe('failure');
-    expect(entry.confidence).toBe(0.3);
-  });
-
-  it('should assign medium confidence for partial outcomes', () => {
-    const turn: ConversationTurn = {
-      userMessage: 'Update all files',
-      assistantResponse: 'I updated some files, however they were not fully completed due to issues.',
-      timestamp: new Date().toISOString(),
-    };
-
-    const entry = autoSaver.extractStateEntry(turn);
-    expect(entry.outcome).toBe('partial');
-    expect(entry.confidence).toBe(0.5);
-  });
-
-  it('should boost confidence when tools return results', () => {
-    const turn: ConversationTurn = {
-      userMessage: 'Search for records',
-      assistantResponse: 'Found 15 matching records.',
-      timestamp: new Date().toISOString(),
-    };
-
-    const entry = autoSaver.extractStateEntry(turn, {
-      toolsUsed: [{ name: 'search', result: 'Found 15 records' }],
-    });
-
-    expect(entry.confidence).toBe(0.9); // 0.8 (success) + 0.1 (tool results)
-  });
-
-  it('should penalize confidence when uncertainty is expressed', () => {
-    const turn: ConversationTurn = {
-      userMessage: 'What caused the issue?',
-      assistantResponse: 'I think the issue was caused by a network timeout, but I am not sure.',
-      timestamp: new Date().toISOString(),
-    };
-
-    const entry = autoSaver.extractStateEntry(turn);
-    expect(entry.confidence).toBeCloseTo(0.6, 5); // 0.8 (success) - 0.2 (uncertainty)
-  });
-
-  it('should clamp confidence to 0.0 minimum', () => {
-    const turn: ConversationTurn = {
-      userMessage: 'Fix the bug',
-      assistantResponse: 'Unfortunately I failed. I think it might be a permission issue but I am not sure.',
-      timestamp: new Date().toISOString(),
-    };
-
-    const entry = autoSaver.extractStateEntry(turn);
-    expect(entry.confidence).toBeCloseTo(0.1, 5); // 0.3 (failure) - 0.2 (uncertainty)
-  });
-});
-
-// ============================================================================
-// ContextWeaver Token Capping Tests (Phase 4)
+// ContextWeaver Token Capping Tests
 // ============================================================================
 
 describe('ContextWeaver State Token Capping', () => {
@@ -823,7 +661,6 @@ describe('ContextWeaver State Token Capping', () => {
   });
 
   it('should trim goals when state context exceeds token limit', async () => {
-    // Create many goals to exceed 500 token limit
     const entries: AgentStateEntry[] = [];
     for (let i = 0; i < 50; i++) {
       entries.push({
@@ -832,17 +669,8 @@ describe('ContextWeaver State Token Capping', () => {
         timestamp: new Date(Date.now() - i * 1000).toISOString(),
         goal: `Goal number ${i}: a fairly long goal description that takes up space in the context`,
         action: `action_${i}`,
-        reasoning: 'testing',
-        outcome: 'deferred' as const,
-        result_summary: 'Pending',
-        lesson: null,
-        constraint_discovered: null,
-        state_before: {},
-        state_after: {},
-        override: null,
-        recommendation: null,
-        confidence: 0.5,
-        superseded_by: null,
+        outcome: 'failure',
+        result: 'Pending',
         active: true,
       });
     }
@@ -854,38 +682,26 @@ describe('ContextWeaver State Token Capping', () => {
 
     const ctx = await contextWeaver.buildStateContext();
 
-    // The prompt should still contain AGENT OPERATIONAL STATE
     expect(ctx.systemPrompt).toContain('AGENT OPERATIONAL STATE');
-    // But should have fewer goals than the 50 we put in
     const goalLines = (ctx.systemPrompt.match(/^- Goal number/gm) || []).length;
     expect(goalLines).toBeLessThan(50);
   });
 
-  it('should preserve directives and constraints during trimming', async () => {
+  it('should preserve constraints during trimming', async () => {
     const entries: AgentStateEntry[] = [];
 
-    // Add entries with directives and constraints
     entries.push({
       id: 'state_d',
       agent_id: 'agent_001',
       timestamp: new Date().toISOString(),
       goal: 'important task',
       action: 'action',
-      reasoning: 'reasoning',
       outcome: 'success',
-      result_summary: 'done',
-      lesson: null,
-      constraint_discovered: 'must not call production API',
-      state_before: {},
-      state_after: {},
-      override: 'Do not retry path X',
-      recommendation: 'Use path Y',
-      confidence: 0.8,
-      superseded_by: null,
+      result: 'done',
+      created_constraint: 'must not call production API',
       active: true,
     });
 
-    // Add many filler entries to trigger trimming
     for (let i = 0; i < 40; i++) {
       entries.push({
         id: `filler_${i}`,
@@ -893,17 +709,9 @@ describe('ContextWeaver State Token Capping', () => {
         timestamp: new Date(Date.now() - (i + 1) * 1000).toISOString(),
         goal: `filler goal ${i} with a long description to take up space`,
         action: 'filler action',
-        reasoning: 'filler',
-        outcome: 'failure' as const,
-        result_summary: `Filler failure result summary for entry ${i}`,
+        outcome: 'failure',
+        result: `Filler failure result for entry ${i}`,
         lesson: `Filler lesson for entry ${i}`,
-        constraint_discovered: null,
-        state_before: {},
-        state_after: {},
-        override: null,
-        recommendation: null,
-        confidence: 0.3,
-        superseded_by: null,
         active: true,
       });
     }
@@ -915,10 +723,6 @@ describe('ContextWeaver State Token Capping', () => {
 
     const ctx = await contextWeaver.buildStateContext();
 
-    // Directives and constraints should always be preserved
     expect(ctx.systemPrompt).toContain('must not call production API');
-    expect(ctx.systemPrompt).toContain('Do not retry path X');
-    expect(ctx.systemPrompt).toContain('Use path Y');
   });
 });
-

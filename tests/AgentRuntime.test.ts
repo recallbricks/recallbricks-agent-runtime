@@ -383,6 +383,175 @@ describe('AgentRuntime', () => {
     });
   });
 
+  describe('reportFailure', () => {
+    it('should create a failure state entry with failure_signature', async () => {
+      const runtime = new AgentRuntime({
+        agentId: 'test_agent',
+        userId: 'test_user',
+        llmProvider: 'anthropic',
+        llmApiKey: 'test_key',
+        apiKey: 'rb_test',
+        debug: true,
+        agentVersion: '2.0.0',
+      });
+
+      const entry = await runtime.reportFailure({
+        goal: 'charge customer',
+        action: 'stripe.charges.create',
+        tool_name: 'stripe',
+        error_code: '429',
+        result: 'rate limited',
+        lesson: 'use batch endpoint for bulk charges',
+      });
+
+      expect(entry.outcome).toBe('failure');
+      expect(entry.tool_name).toBe('stripe');
+      expect(entry.error_code).toBe('429');
+      expect(entry.failure_signature).toBeTruthy();
+      expect(entry.failure_signature).toContain('stripe');
+      expect(entry.failure_signature).toContain('429');
+      expect(entry.source).toBe('explicit');
+      expect(entry.agent_version).toBe('2.0.0');
+    });
+
+    it('should auto-create constraint when createConstraint is provided', async () => {
+      mockAxiosInstance.post.mockImplementation((url: string) => {
+        if (url === '/api/v1/constraints') {
+          return Promise.resolve({
+            data: {
+              id: 'c_auto',
+              agent_id: 'test_agent',
+              constraint_text: 'Do not call stripe.charges.create in bulk',
+              mode: 'observe',
+              active: true,
+            },
+          });
+        }
+        return Promise.resolve({
+          data: { id: 'state_1', created_at: new Date().toISOString() },
+        });
+      });
+
+      const runtime = new AgentRuntime({
+        agentId: 'test_agent',
+        userId: 'test_user',
+        llmProvider: 'anthropic',
+        llmApiKey: 'test_key',
+        apiKey: 'rb_test',
+        debug: true,
+      });
+
+      const entry = await runtime.reportFailure({
+        goal: 'charge customer',
+        action: 'stripe.charges.create',
+        createConstraint: 'Do not call stripe.charges.create in bulk',
+      });
+
+      expect(entry.created_constraint).toBe('c_auto');
+    });
+  });
+
+  describe('reportSuccess', () => {
+    it('should create a success entry and supersede prior failures', async () => {
+      const runtime = new AgentRuntime({
+        agentId: 'test_agent',
+        userId: 'test_user',
+        llmProvider: 'anthropic',
+        llmApiKey: 'test_key',
+        apiKey: 'rb_test',
+        debug: true,
+        autoSave: false,
+      });
+
+      // First report a failure
+      const failEntry = await runtime.reportFailure({
+        goal: 'deploy app',
+        action: 'deploy_tool run',
+        result: 'timeout',
+      });
+      expect(failEntry.active).toBe(true);
+
+      // Then report success for the same goal
+      const successEntry = await runtime.reportSuccess({
+        goal: 'deploy app',
+        action: 'deploy_tool run',
+        result: 'deployed successfully',
+      });
+
+      expect(successEntry.outcome).toBe('success');
+      expect(successEntry.source).toBe('explicit');
+      // The prior failure should be superseded (checked via getActiveStateEntries)
+    });
+  });
+
+  describe('checkBeforeExecute', () => {
+    it('should block tool not in allowedTools', async () => {
+      const runtime = new AgentRuntime({
+        agentId: 'test_agent',
+        userId: 'test_user',
+        llmProvider: 'anthropic',
+        llmApiKey: 'test_key',
+        apiKey: 'rb_test',
+        debug: true,
+        allowedTools: ['read_file', 'write_file'],
+      });
+
+      const result = await runtime.checkBeforeExecute('delete_database');
+
+      expect(result.allowed).toBe(false);
+      expect(result.violations.length).toBe(1);
+      expect(result.violations[0].constraint_text).toContain('delete_database');
+    });
+
+    it('should allow tool in allowedTools (case-insensitive) and call API', async () => {
+      mockAxiosInstance.post.mockImplementation((url: string) => {
+        if (url.includes('/constraints/') && url.includes('/check')) {
+          return Promise.resolve({
+            data: { allowed: true, violations: [] },
+          });
+        }
+        return Promise.resolve({
+          data: { id: 'mem_1', text: 'ok', created_at: new Date().toISOString() },
+        });
+      });
+
+      const runtime = new AgentRuntime({
+        agentId: 'test_agent',
+        userId: 'test_user',
+        llmProvider: 'anthropic',
+        llmApiKey: 'test_key',
+        apiKey: 'rb_test',
+        debug: true,
+        allowedTools: ['Read_File', 'Write_File'],
+      });
+
+      const result = await runtime.checkBeforeExecute('read_file');
+
+      expect(result.allowed).toBe(true);
+    });
+  });
+
+  describe('config options', () => {
+    it('should pass allowedTools, agentVersion, captureMode through config', () => {
+      const runtime = new AgentRuntime({
+        agentId: 'test_agent',
+        userId: 'test_user',
+        llmProvider: 'anthropic',
+        llmApiKey: 'test_key',
+        apiKey: 'rb_test',
+        debug: true,
+        allowedTools: ['tool_a', 'tool_b'],
+        agentVersion: '2.0.0',
+        captureMode: 'tools',
+      });
+
+      const config = runtime.getConfig();
+      expect(config.allowedTools).toEqual(['tool_a', 'tool_b']);
+      expect(config.agentVersion).toBe('2.0.0');
+      expect(config.captureMode).toBe('tools');
+    });
+  });
+
   describe('constraint convenience methods', () => {
     it('getConstraints should return constraints from API', async () => {
       mockAxiosInstance.get.mockImplementation((url: string) => {

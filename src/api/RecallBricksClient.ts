@@ -272,6 +272,13 @@ export class RecallBricksClient {
           agent_id: entry.agent_id,
           goal: entry.goal,
           outcome: entry.outcome,
+          tool_name: entry.tool_name,
+          error_code: entry.error_code,
+          agent_version: entry.agent_version,
+          source: entry.source,
+          blocked_by: entry.blocked_by,
+          recovered_from: entry.recovered_from,
+          created_constraint: entry.created_constraint,
           active: entry.active,
         },
       });

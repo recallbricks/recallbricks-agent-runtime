@@ -14,6 +14,8 @@ export type LLMProvider = 'anthropic' | 'openai' | 'gemini' | 'ollama' | 'cohere
 
 export type RecallBricksTier = 'starter' | 'professional' | 'enterprise';
 
+export type CaptureMode = 'off' | 'tools' | 'auto';
+
 export interface LLMMessage {
   role: 'user' | 'assistant' | 'system';
   content: string;
@@ -109,6 +111,9 @@ export interface RuntimeConfig {
   debug?: boolean;
   mcpMode?: boolean;
   registerAgent?: boolean;
+  allowedTools?: string[];
+  agentVersion?: string;
+  captureMode?: CaptureMode;
 }
 
 export interface RuntimeOptions {
@@ -130,6 +135,9 @@ export interface RuntimeOptions {
   debug?: boolean;
   mcpMode?: boolean;
   registerAgent?: boolean;
+  allowedTools?: string[];
+  agentVersion?: string;
+  captureMode?: CaptureMode;
 }
 
 // ============================================================================

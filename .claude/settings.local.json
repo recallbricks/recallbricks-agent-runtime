@@ -20,7 +20,10 @@
       "Bash(git stash pop:*)",
       "Bash(find:*)",
       "Bash(test:*)",
-      "Bash(npm pack:*)"
+      "Bash(npm pack:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)"
     ],
     "deny": [],
     "ask": []

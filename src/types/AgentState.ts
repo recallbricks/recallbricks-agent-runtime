@@ -13,40 +13,47 @@
 export type AgentStateOutcome =
   | 'success'
   | 'failure'
-  | 'partial'
-  | 'overridden'
-  | 'deferred';
+  | 'blocked'
+  | 'recovered';
 
 export interface AgentStateEntry {
-  id: string;
+  id?: string;
   agent_id: string;
-  timestamp: string;
+  user_id?: string;
+  timestamp?: string;
 
   // What was happening
   goal: string;
   action: string;
-  reasoning: string;
 
   // What happened
   outcome: AgentStateOutcome;
-  result_summary: string;
+  result?: string;
+
+  // Tool details
+  tool_name?: string;
+  error_code?: string;
 
   // What we learned
-  lesson: string | null;
-  constraint_discovered: string | null;
+  lesson?: string;
 
-  // System state
-  state_before: Record<string, unknown>;
-  state_after: Record<string, unknown>;
-
-  // Directives
-  override: string | null;
-  recommendation: string | null;
+  // Enforcement lineage
+  blocked_by?: string;
+  recovered_from?: string;
+  created_constraint?: string;
 
   // Metadata
-  confidence: number;
-  superseded_by: string | null;
-  active: boolean;
+  superseded_by?: string;
+  active?: boolean;
+
+  // Deduplication
+  failure_signature?: string;
+  seen_count?: number;
+  first_seen_at?: string;
+
+  // Source tracking
+  source?: 'auto' | 'explicit';
+  agent_version?: string;
 }
 
 // ============================================================================
@@ -155,12 +162,8 @@ export interface AgentOperationalState {
   recentFailures: Array<{
     goal: string;
     action: string;
-    result_summary: string;
-    lesson: string | null;
+    result: string;
+    tool_name?: string;
+    lesson?: string;
   }>;
-  directives: Array<{
-    type: 'override' | 'recommendation';
-    content: string;
-  }>;
-  currentState: Record<string, unknown>;
 }

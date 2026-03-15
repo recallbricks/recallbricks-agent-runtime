@@ -182,10 +182,10 @@ export class ContextWeaver {
    * Build AgentOperationalState from state entries
    */
   private buildOperationalState(entries: AgentStateEntry[]): AgentOperationalState {
-    const activeEntries = entries.filter(e => e.active);
+    const activeEntries = entries.filter(e => e.active !== false);
     const failureEntries = entries
       .filter(e => e.outcome === 'failure')
-      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+      .sort((a, b) => new Date(b.timestamp || '').getTime() - new Date(a.timestamp || '').getTime())
       .slice(0, 10);
 
     // Extract unique active goals
@@ -195,87 +195,54 @@ export class ContextWeaver {
         .map(e => e.goal)
     )];
 
-    // Extract discovered constraints
+    // Extract created constraints
     const activeConstraints = [
       ...new Set(
         entries
-          .map(e => e.constraint_discovered)
-          .filter((c): c is string => c !== null)
+          .map(e => e.created_constraint)
+          .filter((c): c is string => c !== undefined && c !== null)
       ),
     ];
 
-    // Extract recent failures with lessons
+    // Extract recent failures with lessons and tool_name
     const recentFailures = failureEntries.map(e => ({
       goal: e.goal,
       action: e.action,
-      result_summary: e.result_summary,
+      result: e.result || '',
+      tool_name: e.tool_name,
       lesson: e.lesson,
     }));
-
-    // Extract active directives
-    const directives: AgentOperationalState['directives'] = [];
-    for (const entry of activeEntries) {
-      if (entry.override) {
-        directives.push({ type: 'override' as const, content: entry.override });
-      }
-      if (entry.recommendation) {
-        directives.push({ type: 'recommendation' as const, content: entry.recommendation });
-      }
-    }
-
-    // Merge current system state from the most recent entry
-    const mostRecent = entries
-      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())[0];
-    const currentState = mostRecent?.state_after ?? {};
 
     return {
       activeGoals,
       activeConstraints,
       recentFailures,
-      directives,
-      currentState,
     };
   }
 
   /**
    * Trim operational state to fit within a token budget.
    * Priority (never cut → cut first):
-   *   1. Directives (never cut)
-   *   2. Constraints (never cut)
-   *   3. Failures (cut oldest first)
-   *   4. Goals (cut oldest first)
-   *   5. System state keys (cut excess)
+   *   1. Constraints (never cut)
+   *   2. Failures (cut oldest first)
+   *   3. Goals (cut oldest first)
    */
   private trimOperationalState(
     state: AgentOperationalState,
     maxTokens: number
   ): void {
     const estimate = () => {
-      // Rough estimate of how many tokens the state section will use
       let chars = 30; // "AGENT OPERATIONAL STATE:\n"
       chars += state.activeGoals.reduce((s, g) => s + g.length + 4, 20);
       chars += state.activeConstraints.reduce((s, c) => s + c.length + 4, 0);
       chars += state.recentFailures.reduce(
-        (s, f) => s + f.goal.length + f.action.length + f.result_summary.length + (f.lesson?.length ?? 0) + 40,
-        0
-      );
-      chars += state.directives.reduce((s, d) => s + d.content.length + 20, 0);
-      chars += Object.keys(state.currentState).slice(0, 20).reduce(
-        (s, k) => s + k.length + JSON.stringify(state.currentState[k]).length + 6,
+        (s, f) => s + f.goal.length + f.action.length + f.result.length + (f.tool_name?.length ?? 0) + (f.lesson?.length ?? 0) + 40,
         0
       );
       return Math.ceil(chars / 4);
     };
 
-    let tokens = estimate();
-    if (tokens <= maxTokens) return;
-
-    // Cut system state keys first
-    const stateKeys = Object.keys(state.currentState);
-    while (stateKeys.length > 2 && estimate() > maxTokens) {
-      const key = stateKeys.pop()!;
-      delete state.currentState[key];
-    }
+    if (estimate() <= maxTokens) return;
 
     // Cut goals oldest first (end of array)
     while (state.activeGoals.length > 1 && estimate() > maxTokens) {
@@ -325,32 +292,18 @@ export class ContextWeaver {
       });
     }
 
-    // Recent failures
+    // Recent failures (with tool_name)
     if (state.recentFailures.length > 0) {
       stateSection += `\nRecent failures:\n`;
       state.recentFailures.forEach(f => {
-        stateSection += `- Goal: ${f.goal} | Action: ${f.action} | Result: ${f.result_summary}`;
-        if (f.lesson) stateSection += ` | Lesson: ${f.lesson}`;
+        if (f.tool_name) {
+          stateSection += `- Failure: ${f.tool_name} returned ${f.result}`;
+        } else {
+          stateSection += `- Goal: ${f.goal} | Action: ${f.action} | Result: ${f.result}`;
+        }
+        if (f.lesson) stateSection += ` — lesson: ${f.lesson}`;
         stateSection += '\n';
       });
-    }
-
-    // Directives
-    if (state.directives.length > 0) {
-      stateSection += `\nDirectives:\n`;
-      state.directives.forEach(d => {
-        stateSection += `- [${d.type.toUpperCase()}] ${d.content}\n`;
-      });
-    }
-
-    // Current system state
-    const stateKeys = Object.keys(state.currentState);
-    if (stateKeys.length > 0) {
-      stateSection += `\nCurrent system state:\n`;
-      for (const key of stateKeys.slice(0, 20)) {
-        const val = state.currentState[key];
-        stateSection += `- ${key}: ${JSON.stringify(val)}\n`;
-      }
     }
 
     return `${identitySection}\n\n${stateSection.trim()}\n\n${rulesSection}`;

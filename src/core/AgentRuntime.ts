@@ -134,6 +134,8 @@ export class AgentRuntime {
       tier: this.config.tier!,
       logger: this.logger,
       apiClient: this.apiClient,
+      captureMode: this.config.captureMode,
+      agentVersion: this.config.agentVersion,
     });
 
     // Initialize ReflectionEngine if LLM is available
@@ -395,13 +397,13 @@ export class AgentRuntime {
     this.interactionCount++;
 
     try {
-      // Step 1: Save previous turn (if exists) — both legacy memory and state entry
+      // Step 1: Save previous turn (if exists)
       if (this.previousTurn && this.config.autoSave) {
         this.logger.debug('Saving previous conversation turn');
-        // Legacy memory save (non-blocking)
-        this.autoSaver.save(this.previousTurn).catch((err) => {
-          this.logger.warn('Legacy memory save failed', { error: (err as Error).message });
-        });
+        // SILENCED v2: Legacy memory save removed - state entries are the source of truth
+        // this.autoSaver.save(this.previousTurn).catch((err) => {
+        //   this.logger.warn('Legacy memory save failed', { error: (err as Error).message });
+        // });
         // State entry extraction and save (non-blocking)
         this.autoSaver.saveStateEntry(this.previousTurn).catch((err) => {
           this.logger.warn('State entry save failed', { error: (err as Error).message });
@@ -471,13 +473,20 @@ export class AgentRuntime {
           );
           const constraintTexts = blockedViolations.map(v => v.constraint_text).join('; ');
 
-          // Record the blocked attempt as a state entry
+          // Record the blocked attempt as a state entry with blocked_by lineage
+          const blockedEntryId = `state_blocked_${Date.now()}`;
+          const blockedConstraintId = blockedViolations[0]?.constraint_id;
           const blockedTurn: ConversationTurn = {
             userMessage: message,
             assistantResponse: `[BLOCKED] Action blocked by constraints: ${constraintTexts}`,
             timestamp: new Date().toISOString(),
           };
-          this.autoSaver.saveStateEntry(blockedTurn).catch((err) => {
+          this.autoSaver.saveStateEntry(blockedTurn).then((entry) => {
+            // Patch the entry with blocked_by lineage
+            entry.blocked_by = blockedConstraintId;
+            entry.outcome = 'blocked';
+            entry.id = blockedEntryId;
+          }).catch((err) => {
             this.logger.warn('Failed to save blocked state entry', { error: (err as Error).message });
           });
 
@@ -508,13 +517,16 @@ export class AgentRuntime {
           const recoveryMessages = this.buildEnrichedMessages(recoveryPrompt, conversationHistory);
           const recoveryLLMResponse = await this.llmAdapter.chat(recoveryMessages);
 
-          // Record recovery as a state entry
+          // Record recovery as a state entry with recovered_from lineage
           const recoveryTurn: ConversationTurn = {
             userMessage: recoveryPrompt,
             assistantResponse: recoveryLLMResponse.content,
             timestamp: new Date().toISOString(),
           };
-          this.autoSaver.saveStateEntry(recoveryTurn).catch((err) => {
+          this.autoSaver.saveStateEntry(recoveryTurn).then((entry) => {
+            entry.recovered_from = blockedEntryId;
+            entry.outcome = 'recovered';
+          }).catch((err) => {
             this.logger.warn('Failed to save recovery state entry', { error: (err as Error).message });
           });
 
@@ -596,25 +608,21 @@ export class AgentRuntime {
 
       // Step 6: Validate response for identity leakage
       let finalResponse = llmResponse.content;
-      let identityValidated = false;
+      const identityValidated = false;
 
-      if (this.identityValidator) {
-        this.logger.debug('Validating response for identity violations');
-        const validation = this.identityValidator.validate(llmResponse.content);
-
-        if (!validation.isValid) {
-          this.logger.warn('Identity violations detected', {
-            count: validation.violations.length,
-          });
-
-          if (validation.correctedResponse) {
-            finalResponse = validation.correctedResponse;
-            identityValidated = true;
-          }
-        } else {
-          identityValidated = true;
-        }
-      }
+      // SILENCED v2: Identity validation not part of regression prevention
+      // if (this.identityValidator) {
+      //   this.logger.debug('Validating response for identity violations');
+      //   const validation = this.identityValidator.validate(llmResponse.content);
+      //   if (!validation.isValid) {
+      //     if (validation.correctedResponse) {
+      //       finalResponse = validation.correctedResponse;
+      //       identityValidated = true;
+      //     }
+      //   } else {
+      //     identityValidated = true;
+      //   }
+      // }
 
       // Step 7: Store current turn for next save
       this.previousTurn = {
@@ -623,10 +631,10 @@ export class AgentRuntime {
         timestamp: new Date().toISOString(),
       };
 
-      // Record interaction for reflection engine
-      if (this.reflectionEngine) {
-        this.reflectionEngine.recordInteraction(this.previousTurn);
-      }
+      // SILENCED v2: LLM reflection removed - ledger captures this data
+      // if (this.reflectionEngine) {
+      //   this.reflectionEngine.recordInteraction(this.previousTurn);
+      // }
 
       // Step 8: Update conversation history
       this.conversationHistory.push(
@@ -641,20 +649,17 @@ export class AgentRuntime {
         tokensUsed: llmResponse.usage?.totalTokens,
       });
 
-      // Check if we should trigger a reflection
-      if (this.reflectionEngine) {
-        const { shouldReflect, trigger } = this.reflectionEngine.shouldReflect();
-        if (shouldReflect && trigger) {
-          // Run reflection in background (don't block response)
-          this.reflectionEngine.reflect(trigger).then((reflection) => {
-            this.logger.info('Background reflection completed', {
-              insights: reflection.insights.length,
-            });
-          }).catch((err) => {
-            this.logger.warn('Background reflection failed', { error: err.message });
-          });
-        }
-      }
+      // SILENCED v2: LLM reflection removed - ledger captures this data
+      // if (this.reflectionEngine) {
+      //   const { shouldReflect, trigger } = this.reflectionEngine.shouldReflect();
+      //   if (shouldReflect && trigger) {
+      //     this.reflectionEngine.reflect(trigger).then((reflection) => {
+      //       this.logger.info('Background reflection completed', { insights: reflection.insights.length });
+      //     }).catch((err) => {
+      //       this.logger.warn('Background reflection failed', { error: err.message });
+      //     });
+      //   }
+      // }
 
       return {
         response: finalResponse,
@@ -1065,5 +1070,171 @@ export class AgentRuntime {
     }
 
     return local;
+  }
+
+  // ============================================================================
+  // Explicit Reporting Methods
+  // ============================================================================
+
+  /**
+   * Report a failure explicitly (e.g., from tool execution).
+   * Creates a failure state entry, optionally auto-creates a constraint.
+   */
+  async reportFailure(data: {
+    goal: string;
+    action: string;
+    tool_name?: string;
+    error_code?: string;
+    result?: string;
+    lesson?: string;
+    createConstraint?: string;
+  }): Promise<AgentStateEntry> {
+    this.logger.info('Reporting failure', { goal: data.goal, tool_name: data.tool_name });
+
+    const failureSignature = [
+      data.goal,
+      data.tool_name || 'unknown',
+      data.error_code || data.result?.substring(0, 100) || 'unknown',
+    ].join(':').toLowerCase();
+
+    const entry: AgentStateEntry = {
+      id: `state_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      agent_id: this.config.agentId,
+      timestamp: new Date().toISOString(),
+      goal: data.goal,
+      action: data.action,
+      outcome: 'failure',
+      result: data.result,
+      tool_name: data.tool_name,
+      error_code: data.error_code,
+      lesson: data.lesson,
+      failure_signature: failureSignature,
+      seen_count: 1,
+      first_seen_at: new Date().toISOString(),
+      source: 'explicit',
+      agent_version: this.config.agentVersion,
+      active: true,
+    };
+
+    // Auto-create constraint if provided
+    if (data.createConstraint) {
+      try {
+        const constraint = await this.apiClient.createConstraint({
+          agent_id: this.config.agentId,
+          constraint_text: data.createConstraint,
+          mode: 'observe',
+        });
+        entry.created_constraint = constraint.id;
+        this.logger.info('Auto-created constraint from failure', { constraintId: constraint.id });
+      } catch (err) {
+        this.logger.warn('Failed to auto-create constraint', { error: (err as Error).message });
+      }
+    }
+
+    // Save to API
+    if (this.apiClient) {
+      try {
+        const { id: _id, ...entryWithoutId } = entry;
+        const response = await this.apiClient.saveState(entryWithoutId);
+        entry.id = response.id || entry.id;
+      } catch {
+        this.logger.warn('Failed to save failure entry to API, kept locally');
+      }
+    }
+
+    return entry;
+  }
+
+  /**
+   * Report a success explicitly (e.g., from tool execution).
+   * Creates a success state entry and supersedes prior failures for the same goal.
+   */
+  async reportSuccess(data: {
+    goal: string;
+    action: string;
+    tool_name?: string;
+    result?: string;
+  }): Promise<AgentStateEntry> {
+    this.logger.info('Reporting success', { goal: data.goal, tool_name: data.tool_name });
+
+    const entry: AgentStateEntry = {
+      id: `state_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      agent_id: this.config.agentId,
+      timestamp: new Date().toISOString(),
+      goal: data.goal,
+      action: data.action,
+      outcome: 'success',
+      result: data.result,
+      tool_name: data.tool_name,
+      source: 'explicit',
+      agent_version: this.config.agentVersion,
+      active: true,
+    };
+
+    // Supersede prior failures for the same goal
+    const existingEntries = this.autoSaver.getActiveStateEntries();
+    for (const existing of existingEntries) {
+      if (existing.outcome === 'failure' && existing.goal === data.goal) {
+        existing.active = false;
+        existing.superseded_by = entry.id;
+      }
+    }
+
+    // Save to API
+    if (this.apiClient) {
+      try {
+        const { id: _id, ...entryWithoutId } = entry;
+        const response = await this.apiClient.saveState(entryWithoutId);
+        entry.id = response.id || entry.id;
+      } catch {
+        this.logger.warn('Failed to save success entry to API, kept locally');
+      }
+    }
+
+    return entry;
+  }
+
+  /**
+   * Check if a tool execution is allowed before running it.
+   * First checks allowedTools whitelist, then API constraint check.
+   */
+  async checkBeforeExecute(
+    toolName: string,
+    args?: Record<string, unknown>
+  ): Promise<ConstraintCheckResult> {
+    this.logger.debug('Checking before execute', { toolName });
+
+    // Check allowedTools whitelist (case-insensitive)
+    if (this.config.allowedTools && this.config.allowedTools.length > 0) {
+      const allowed = this.config.allowedTools.some(
+        t => t.toLowerCase() === toolName.toLowerCase()
+      );
+      if (!allowed) {
+        return {
+          allowed: false,
+          violations: [{
+            constraint_id: 'allowedTools',
+            constraint_text: `Tool "${toolName}" is not in the allowed tools list`,
+            decision: 'blocked',
+            mode: 'enforce',
+          }],
+        };
+      }
+    }
+
+    // Check API constraints
+    const proposedAction = args
+      ? `${toolName}(${JSON.stringify(args).slice(0, 200)})`
+      : toolName;
+
+    try {
+      return await this.apiClient.checkConstraints(
+        this.config.agentId,
+        proposedAction
+      );
+    } catch {
+      this.logger.warn('Constraint check failed, failing open');
+      return { allowed: true, violations: [] };
+    }
   }
 }

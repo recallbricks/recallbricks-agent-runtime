@@ -210,6 +210,9 @@ export class ConfigBuilder {
       debug: options.debug || false,
       mcpMode,
       registerAgent: options.registerAgent || false,
+      allowedTools: options.allowedTools,
+      agentVersion: options.agentVersion,
+      captureMode: options.captureMode || 'tools',
     };
 
     this.validateConfig(config);

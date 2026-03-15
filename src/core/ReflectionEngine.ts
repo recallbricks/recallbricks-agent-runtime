@@ -279,7 +279,7 @@ export class ReflectionEngine {
 
     // Sort entries chronologically
     const sorted = [...stateEntries].sort(
-      (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+      (a, b) => new Date(a.timestamp || '').getTime() - new Date(b.timestamp || '').getTime()
     );
 
     // Build reasoning steps from state entries
@@ -287,11 +287,12 @@ export class ReflectionEngine {
     const stateRefs: string[] = [];
 
     for (const entry of sorted) {
-      stateRefs.push(entry.id);
+      if (entry.id) stateRefs.push(entry.id);
 
+      const toolInfo = entry.tool_name ? ` (tool: ${entry.tool_name})` : '';
       const step: ReasoningStep = {
-        thought: `I attempted "${entry.goal}" by ${entry.action}. Reasoning: ${entry.reasoning}`,
-        observation: `Outcome: ${entry.outcome} — ${entry.result_summary}`,
+        thought: `I attempted "${entry.goal}" by ${entry.action}${toolInfo}`,
+        observation: `Outcome: ${entry.outcome} — ${entry.result || 'no result recorded'}`,
       };
 
       if (entry.lesson) {
@@ -302,7 +303,6 @@ export class ReflectionEngine {
     }
 
     // Build conclusion from the most recent active entries
-    const activeEntries = sorted.filter(e => e.active);
     const failures = sorted.filter(e => e.outcome === 'failure');
     const latestEntry = sorted[sorted.length - 1];
 
@@ -310,32 +310,18 @@ export class ReflectionEngine {
 
     if (failures.length > 0) {
       const lastFailure = failures[failures.length - 1];
-      conclusion += `I attempted "${lastFailure.goal}" and it failed: ${lastFailure.result_summary}. `;
+      conclusion += `I attempted "${lastFailure.goal}" and it failed: ${lastFailure.result || 'unknown error'}. `;
       if (lastFailure.lesson) {
         conclusion += `I learned: ${lastFailure.lesson}. `;
       }
     }
 
-    // Add active directives
-    const directives = activeEntries.filter(e => e.override || e.recommendation);
-    if (directives.length > 0) {
-      const directive = directives[directives.length - 1];
-      if (directive.override) {
-        conclusion += `Current directive: ${directive.override}. `;
-      }
-      if (directive.recommendation) {
-        conclusion += `Next approach: ${directive.recommendation}. `;
-      }
-    }
-
     if (!conclusion) {
-      conclusion = `Last action: "${latestEntry.goal}" — ${latestEntry.outcome}: ${latestEntry.result_summary}`;
+      conclusion = `Last action: "${latestEntry.goal}" — ${latestEntry.outcome}: ${latestEntry.result || 'completed'}`;
     }
 
-    // Calculate confidence based on number and quality of entries
-    const avgConfidence =
-      sorted.reduce((sum, e) => sum + e.confidence, 0) / sorted.length;
-    const confidence = Math.min(1, avgConfidence + steps.length * 0.02);
+    // Calculate confidence based on number of entries
+    const confidence = Math.min(1, 0.5 + steps.length * 0.05);
 
     return {
       query,

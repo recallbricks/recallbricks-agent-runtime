@@ -8,17 +8,14 @@
  * Uses POST /api/v1/state endpoint (primary - agent state tracking)
  */
 
-import axios, { AxiosInstance } from 'axios';
-import pRetry from 'p-retry';
 import {
   ConversationTurn,
   SaveConversationResponse,
-  SaveResponse,
   RecallBricksTier,
-  APIError,
   Logger,
   AgentStateEntry,
   AgentStateOutcome,
+  CaptureMode,
 } from '../types';
 import { RecallBricksClient } from '../api/RecallBricksClient';
 
@@ -34,6 +31,8 @@ interface AutoSaverConfig {
   tier: RecallBricksTier;
   logger: Logger;
   apiClient?: RecallBricksClient;
+  captureMode?: CaptureMode;
+  agentVersion?: string;
 }
 
 // ============================================================================
@@ -56,7 +55,6 @@ export interface StateExtractionContext {
 // - Tier 3: Deep analysis after 5+ retrievals (Sonnet in background)
 
 export class AutoSaver {
-  private apiClient: AxiosInstance;
   private rbClient?: RecallBricksClient;
   private saveQueue: Array<{
     turn: ConversationTurn;
@@ -75,18 +73,9 @@ export class AutoSaver {
   constructor(private config: AutoSaverConfig) {
     this.rbClient = config.apiClient;
 
-    this.apiClient = axios.create({
-      baseURL: config.apiUrl,
-      timeout: 30000,
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-Key': config.apiKey,
-      },
-    });
-
     config.logger.debug('AutoSaver initialized', {
       tier: config.tier,
-      apiUrl: config.apiUrl,
+      captureMode: config.captureMode || 'tools',
     });
   }
 
@@ -109,59 +98,35 @@ export class AutoSaver {
    * Save a conversation turn synchronously (blocking)
    * Legacy: saves as text memory
    */
-  async saveSync(turn: ConversationTurn): Promise<SaveConversationResponse> {
-    this.config.logger.debug('Saving conversation turn synchronously');
-
-    const importance = turn.importance ?? (await this.classifyImportance(turn));
-
-    // Format conversation as single text string for the save endpoint
-    const conversationText = `User: ${turn.userMessage}
-Assistant: ${turn.assistantResponse}`;
-
-    try {
-      const response = await pRetry(
-        async () => {
-          // Use /api/v1/memories endpoint
-          // API handles tier upgrades automatically based on retrieval count
-          const result = await this.apiClient.post<SaveResponse>(
-            '/api/v1/memories',
-            {
-              text: conversationText,
-              source: 'agent-runtime',
-              metadata: {
-                importance: importance,
-                agent_id: this.config.agentId,
-                timestamp: turn.timestamp,
-              },
-            }
-          );
-          return result.data;
-        },
-        {
-          retries: 3,
-          minTimeout: 1000,
-          onFailedAttempt: (error) => {
-            this.config.logger.warn(
-              `Save attempt ${error.attemptNumber} failed. ${error.retriesLeft} retries left.`
-            );
-          },
-        }
-      );
-
-      this.config.logger.info('Conversation saved successfully', {
-        memoryId: response.id,
-        importance: response.metadata?.importance ?? importance,
-      });
-
-      return {
-        success: true,
-        memoryId: response.id,
-        importance: response.metadata?.importance ?? importance,
-      };
-    } catch (error) {
-      this.config.logger.error('Failed to save conversation', { error });
-      throw this.handleAPIError(error);
-    }
+  async saveSync(_turn: ConversationTurn): Promise<SaveConversationResponse> {
+    // SILENCED v2: Legacy memory save removed - state entries are the source of truth
+    // const importance = turn.importance ?? (await this.classifyImportance(turn));
+    // const conversationText = `User: ${turn.userMessage}\nAssistant: ${turn.assistantResponse}`;
+    // try {
+    //   const response = await pRetry(
+    //     async () => {
+    //       const result = await this.apiClient.post<SaveResponse>(
+    //         '/api/v1/memories',
+    //         {
+    //           text: conversationText,
+    //           source: 'agent-runtime',
+    //           metadata: {
+    //             importance: importance,
+    //             agent_id: this.config.agentId,
+    //             timestamp: turn.timestamp,
+    //           },
+    //         }
+    //       );
+    //       return result.data;
+    //     },
+    //     { retries: 3, minTimeout: 1000 }
+    //   );
+    //   return { success: true, memoryId: response.id, importance: response.metadata?.importance ?? importance };
+    // } catch (error) {
+    //   throw this.handleAPIError(error);
+    // }
+    this.config.logger.debug('Legacy memory save silenced — using state entries');
+    return { success: true, importance: 0.5 };
   }
 
   // ==========================================================================
@@ -170,7 +135,9 @@ Assistant: ${turn.assistantResponse}`;
 
   /**
    * Extract a structured state entry from a conversation turn.
-   * Uses heuristics only — no LLM calls.
+   * In 'tools' mode: only captures on clear error signals.
+   * In 'auto' mode: uses full heuristic extraction.
+   * In 'off' mode: does not capture (returns minimal entry).
    */
   extractStateEntry(
     turn: ConversationTurn,
@@ -183,16 +150,61 @@ Assistant: ${turn.assistantResponse}`;
       if (context.toolsUsed) this.extractionContext.toolsUsed = context.toolsUsed;
     }
 
+    const captureMode = this.config.captureMode || 'tools';
+
+    // In 'tools' mode, only capture on clear error signals from tools
+    if (captureMode === 'tools') {
+      const toolErrorSignal = this.detectToolErrorSignal(turn);
+      if (!toolErrorSignal) {
+        // No error signal — create minimal success entry
+        const entryId = `state_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        const goal = this.extractGoal(turn);
+        const entry: AgentStateEntry = {
+          id: entryId,
+          agent_id: this.config.agentId,
+          timestamp: turn.timestamp || new Date().toISOString(),
+          goal,
+          action: this.extractAction(turn),
+          outcome: 'success',
+          result: turn.assistantResponse.slice(0, 150).trim(),
+          tool_name: this.extractionContext.toolsUsed?.[0]?.name,
+          source: 'auto',
+          agent_version: this.config.agentVersion,
+          active: true,
+        };
+        this.handleSupersession(entry);
+        this.stateEntries.push(entry);
+        return entry;
+      }
+    }
+
+    // 'off' mode: minimal entry
+    if (captureMode === 'off') {
+      const entryId = `state_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const entry: AgentStateEntry = {
+        id: entryId,
+        agent_id: this.config.agentId,
+        timestamp: turn.timestamp || new Date().toISOString(),
+        goal: turn.userMessage.slice(0, 120),
+        action: 'generated response',
+        outcome: 'success',
+        source: 'auto',
+        agent_version: this.config.agentVersion,
+        active: true,
+      };
+      this.stateEntries.push(entry);
+      return entry;
+    }
+
+    // 'auto' mode (or 'tools' mode with error signal): full heuristic extraction
     const goal = this.extractGoal(turn);
     const action = this.extractAction(turn);
     const outcome = this.extractOutcome(turn);
-    const reasoning = this.extractReasoning(turn);
-    const confidence = this.calculateConfidence(turn, outcome);
 
     const entryId = `state_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-    // Check if this supersedes a previous entry for the same goal
-    const supersededEntry = this.findSupersededEntry(goal);
+    const toolName = this.extractionContext.toolsUsed?.[0]?.name;
+    const errorCode = this.extractErrorCode(turn);
 
     const entry: AgentStateEntry = {
       id: entryId,
@@ -200,34 +212,102 @@ Assistant: ${turn.assistantResponse}`;
       timestamp: turn.timestamp || new Date().toISOString(),
       goal,
       action,
-      reasoning,
       outcome,
-      result_summary: this.extractResultSummary(turn, outcome),
+      result: this.extractResult(turn, outcome),
+      tool_name: toolName,
+      error_code: errorCode,
       lesson: this.extractLesson(turn),
-      constraint_discovered: this.extractConstraint(turn),
-      state_before: {
-        turn_number: this.extractionContext.turnNumber - 1,
-        active_goals: [...this.extractionContext.sessionGoals],
-      },
-      state_after: {
-        turn_number: this.extractionContext.turnNumber,
-        active_goals: this.updateGoals(goal, outcome),
-      },
-      override: null,
-      recommendation: this.extractRecommendation(turn),
-      confidence,
-      superseded_by: null,
+      source: 'auto',
+      agent_version: this.config.agentVersion,
       active: true,
     };
 
-    // Mark superseded entry as inactive
-    if (supersededEntry) {
-      supersededEntry.active = false;
-      supersededEntry.superseded_by = entryId;
+    // Generate failure_signature for deduplication
+    if (outcome === 'failure') {
+      entry.failure_signature = this.generateFailureSignature(goal, toolName, errorCode, turn);
+      entry.first_seen_at = new Date().toISOString();
+      entry.seen_count = 1;
+
+      // Check for existing failure with same signature
+      const existing = this.stateEntries.find(
+        e => e.failure_signature === entry.failure_signature && e.active
+      );
+      if (existing) {
+        existing.seen_count = (existing.seen_count || 1) + 1;
+      }
     }
 
+    this.handleSupersession(entry);
     this.stateEntries.push(entry);
     return entry;
+  }
+
+  /**
+   * Detect clear error signals from tool usage (non-2xx, exceptions, timeouts, rate limits)
+   */
+  private detectToolErrorSignal(turn: ConversationTurn): boolean {
+    const tools = this.extractionContext.toolsUsed;
+    if (tools?.length) {
+      return tools.some(
+        t => t.result && /error|fail|exception|denied|timeout|429|5\d{2}|rate.?limit/i.test(t.result)
+      );
+    }
+    // Also check response for clear error signals (non-heuristic)
+    const response = turn.assistantResponse;
+    return /\[BLOCKED\]|\[ERROR\]|HTTP [45]\d{2}|status code [45]\d{2}/i.test(response);
+  }
+
+  /**
+   * Extract error code from tool results or response
+   */
+  private extractErrorCode(turn: ConversationTurn): string | undefined {
+    const tools = this.extractionContext.toolsUsed;
+    if (tools?.length) {
+      for (const t of tools) {
+        if (t.result) {
+          const httpMatch = t.result.match(/\b([45]\d{2})\b/);
+          if (httpMatch) return httpMatch[1];
+          if (/timeout/i.test(t.result)) return 'TIMEOUT';
+          if (/rate.?limit/i.test(t.result)) return '429';
+        }
+      }
+    }
+    const httpMatch = turn.assistantResponse.match(/\b(?:HTTP\s+|status\s+(?:code\s+)?)([45]\d{2})\b/i);
+    if (httpMatch) return httpMatch[1];
+    return undefined;
+  }
+
+  /**
+   * Generate failure signature for deduplication
+   * Format: lowercase(goal + ':' + toolName + ':' + errorCode/error.substring(0,100))
+   */
+  private generateFailureSignature(
+    goal: string,
+    toolName?: string,
+    errorCode?: string,
+    turn?: ConversationTurn
+  ): string {
+    const parts = [goal, toolName || 'unknown'];
+    if (errorCode) {
+      parts.push(errorCode);
+    } else if (turn) {
+      const errorMatch = turn.assistantResponse.match(/(?:error|failed)[:\s]+([^.]{1,100})/i);
+      parts.push(errorMatch ? errorMatch[1].trim() : 'unknown');
+    } else {
+      parts.push('unknown');
+    }
+    return parts.join(':').toLowerCase();
+  }
+
+  /**
+   * Handle supersession of previous entries with same goal
+   */
+  private handleSupersession(entry: AgentStateEntry): void {
+    const supersededEntry = this.findSupersededEntry(entry.goal);
+    if (supersededEntry) {
+      supersededEntry.active = false;
+      supersededEntry.superseded_by = entry.id;
+    }
   }
 
   /**
@@ -283,7 +363,7 @@ Assistant: ${turn.assistantResponse}`;
    * Get active state entries only
    */
   getActiveStateEntries(): AgentStateEntry[] {
-    return this.stateEntries.filter(e => e.active);
+    return this.stateEntries.filter(e => e.active !== false);
   }
 
   // ==========================================================================
@@ -345,6 +425,12 @@ Assistant: ${turn.assistantResponse}`;
   private extractOutcome(turn: ConversationTurn): AgentStateOutcome {
     const response = turn.assistantResponse.toLowerCase();
 
+    // Check for blocked responses
+    if (/\[blocked\]/i.test(turn.assistantResponse)) return 'blocked';
+
+    // Check for recovery responses
+    if (/\[recovered\]/i.test(turn.assistantResponse)) return 'recovered';
+
     // Check for tool results
     if (this.extractionContext.toolsUsed?.length) {
       const hasFailure = this.extractionContext.toolsUsed.some(
@@ -365,55 +451,10 @@ Assistant: ${turn.assistantResponse}`;
       if (pattern.test(response)) return 'failure';
     }
 
-    // Partial indicators
-    const partialPatterns = [
-      /\bhowever\b.*\bbut\b/,
-      /\bpartially\b/,
-      /\bsome (?:of|issues|limitations)\b/,
-      /\bnot (?:fully|completely|entirely)\b/,
-    ];
-    for (const pattern of partialPatterns) {
-      if (pattern.test(response)) return 'partial';
-    }
-
-    // Deferred indicators
-    const deferredPatterns = [
-      /\blater\b/,
-      /\bneed more (?:info|information|context|details)\b/,
-      /\bclarif(?:y|ication)\b/,
-    ];
-    for (const pattern of deferredPatterns) {
-      if (pattern.test(response)) return 'deferred';
-    }
-
     return 'success';
   }
 
-  private extractReasoning(turn: ConversationTurn): string {
-    // If reflection engine output is available, use it
-    if (this.extractionContext.reflectionOutput) {
-      return this.extractionContext.reflectionOutput.slice(0, 300);
-    }
-
-    // Look for reasoning phrases in the response
-    const response = turn.assistantResponse;
-    const reasoningPatterns = [
-      /because\s+([^.]{10,100})/i,
-      /the reason (?:is|for this)\s+([^.]{10,100})/i,
-      /this is (?:due to|because)\s+([^.]{10,100})/i,
-      /based on\s+([^.]{10,100})/i,
-      /since\s+([^.]{10,100})/i,
-    ];
-
-    for (const pattern of reasoningPatterns) {
-      const match = response.match(pattern);
-      if (match) return match[1].trim();
-    }
-
-    return `Turn ${this.extractionContext.turnNumber}: processing user request`;
-  }
-
-  private extractResultSummary(turn: ConversationTurn, outcome: AgentStateOutcome): string {
+  private extractResult(turn: ConversationTurn, outcome: AgentStateOutcome): string {
     const response = turn.assistantResponse;
 
     if (outcome === 'failure') {
@@ -431,10 +472,10 @@ Assistant: ${turn.assistantResponse}`;
     return response.slice(0, 150).trim();
   }
 
-  private extractLesson(turn: ConversationTurn): string | null {
-    // Only extract lessons from failures or partial outcomes
+  private extractLesson(turn: ConversationTurn): string | undefined {
+    // Only extract lessons from failures
     const outcome = this.extractOutcome(turn);
-    if (outcome !== 'failure' && outcome !== 'partial') return null;
+    if (outcome !== 'failure') return undefined;
 
     const lessonPatterns = [
       /(?:lesson|takeaway|key insight)[:\s]+([^.]{10,150})/i,
@@ -452,37 +493,7 @@ Assistant: ${turn.assistantResponse}`;
       return `Action failed at turn ${this.extractionContext.turnNumber}`;
     }
 
-    return null;
-  }
-
-  private extractConstraint(turn: ConversationTurn): string | null {
-    const constraintPatterns = [
-      /(?:cannot|can't|unable to|not allowed to|restricted from)\s+([^.]{10,100})/i,
-      /(?:limitation|constraint|restriction)[:\s]+([^.]{10,100})/i,
-      /(?:not possible|not supported|not available)\s+([^.]{10,100})/i,
-      /(?:requires?|must have|needs?)\s+([^.]{10,100})/i,
-    ];
-
-    for (const pattern of constraintPatterns) {
-      const match = turn.assistantResponse.match(pattern);
-      if (match) return match[1].trim();
-    }
-
-    return null;
-  }
-
-  private extractRecommendation(turn: ConversationTurn): string | null {
-    const recommendationPatterns = [
-      /(?:i recommend|i suggest|you should|consider)\s+([^.]{10,150})/i,
-      /(?:the best approach|a better approach|instead, try)\s+([^.]{10,150})/i,
-    ];
-
-    for (const pattern of recommendationPatterns) {
-      const match = turn.assistantResponse.match(pattern);
-      if (match) return match[1].trim();
-    }
-
-    return null;
+    return undefined;
   }
 
   private findSupersededEntry(goal: string): AgentStateEntry | undefined {
@@ -498,66 +509,6 @@ Assistant: ${turn.assistantResponse}`;
       // Consider it the same goal if >60% word overlap
       return overlap.length / Math.max(goalWords.size, 1) > 0.6;
     });
-  }
-
-  private updateGoals(currentGoal: string, outcome: AgentStateOutcome): string[] {
-    const goals = [...this.extractionContext.sessionGoals];
-
-    if (outcome === 'success') {
-      // Remove completed goal
-      const idx = goals.findIndex(g => g === currentGoal);
-      if (idx >= 0) goals.splice(idx, 1);
-    } else if (!goals.includes(currentGoal)) {
-      goals.push(currentGoal);
-    }
-
-    this.extractionContext.sessionGoals = goals;
-    return goals;
-  }
-
-  /**
-   * Calculate confidence based on outcome and response signals.
-   * Replaces the old calculateHeuristicImportance for state entries.
-   */
-  private calculateConfidence(turn: ConversationTurn, outcome: AgentStateOutcome): number {
-    // Base confidence from outcome
-    let confidence: number;
-    switch (outcome) {
-      case 'success': confidence = 0.8; break;
-      case 'failure': confidence = 0.3; break;
-      case 'partial': confidence = 0.5; break;
-      case 'deferred': confidence = 0.4; break;
-      case 'overridden': confidence = 0.6; break;
-      default: confidence = 0.5;
-    }
-
-    // Bonus: tools were used and returned results
-    if (this.extractionContext.toolsUsed?.length) {
-      const hasResults = this.extractionContext.toolsUsed.some(
-        t => t.result && !/error|fail|exception|denied/i.test(t.result)
-      );
-      if (hasResults) confidence += 0.1;
-    }
-
-    // Penalty: agent expressed uncertainty
-    const response = turn.assistantResponse.toLowerCase();
-    const uncertaintyPatterns = [
-      /\bi think\b/,
-      /\bprobably\b/,
-      /\bnot sure\b/,
-      /\bperhaps\b/,
-      /\bmight be\b/,
-      /\bnot certain\b/,
-    ];
-    for (const pattern of uncertaintyPatterns) {
-      if (pattern.test(response)) {
-        confidence -= 0.2;
-        break; // Apply penalty only once
-      }
-    }
-
-    // Clamp to 0.0 - 1.0
-    return Math.max(0, Math.min(1, confidence));
   }
 
   // ==========================================================================
@@ -592,69 +543,8 @@ Assistant: ${turn.assistantResponse}`;
     this.isProcessing = false;
   }
 
-  /**
-   * Classify importance of a conversation turn
-   */
-  private async classifyImportance(
-    turn: ConversationTurn
-  ): Promise<number> {
-    this.config.logger.debug('Classifying conversation importance');
-
-    // For now, use a simple heuristic
-    // In production, this would call the metacognition engine's classification API
-    const importance = this.calculateHeuristicImportance(turn);
-
-    this.config.logger.debug('Importance classified', { importance });
-
-    return importance;
-  }
-
-  /**
-   * Calculate importance using heuristics
-   */
-  private calculateHeuristicImportance(turn: ConversationTurn): number {
-    let score = 0.5; // Base importance
-
-    // Length of response (longer = potentially more important)
-    const responseLength = turn.assistantResponse.length;
-    if (responseLength > 1000) score += 0.2;
-    else if (responseLength > 500) score += 0.1;
-
-    // Question indicators (questions often signal important information gathering)
-    const questionCount = (turn.userMessage.match(/\?/g) || []).length;
-    score += Math.min(questionCount * 0.1, 0.2);
-
-    // Exclamation points (excitement/importance)
-    const exclamationCount = (turn.userMessage.match(/!/g) || []).length;
-    score += Math.min(exclamationCount * 0.05, 0.1);
-
-    // Code blocks (technical content is often important)
-    const codeBlockCount = (turn.assistantResponse.match(/```/g) || []).length / 2;
-    score += Math.min(codeBlockCount * 0.1, 0.2);
-
-    // Keywords indicating importance
-    const importantKeywords = [
-      'important',
-      'critical',
-      'remember',
-      'note',
-      'warning',
-      'error',
-      'issue',
-      'problem',
-      'solution',
-      'decision',
-    ];
-
-    const lowerMessage = turn.userMessage.toLowerCase();
-    const keywordMatches = importantKeywords.filter((keyword) =>
-      lowerMessage.includes(keyword)
-    ).length;
-    score += Math.min(keywordMatches * 0.1, 0.3);
-
-    // Clamp between 0 and 1
-    return Math.max(0, Math.min(1, score));
-  }
+  // SILENCED v2: classifyImportance and calculateHeuristicImportance removed
+  // Legacy memory save is silenced — state entries are the source of truth
 
   /**
    * Wait for all queued saves to complete
@@ -678,27 +568,4 @@ Assistant: ${turn.assistantResponse}`;
     return this.saveQueue.length;
   }
 
-  /**
-   * Handle API errors
-   */
-  private handleAPIError(error: unknown): APIError {
-    if (axios.isAxiosError(error)) {
-      const status = error.response?.status || 500;
-      const message =
-        error.response?.data?.message ||
-        error.message ||
-        'Unknown API error';
-
-      return new APIError(message, status, {
-        url: error.config?.url,
-        method: error.config?.method,
-      });
-    }
-
-    if (error instanceof Error) {
-      return new APIError(error.message, 500);
-    }
-
-    return new APIError('Unknown error occurred', 500, { error });
-  }
 }
