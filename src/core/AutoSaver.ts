@@ -44,6 +44,12 @@ export interface StateExtractionContext {
   sessionGoals: string[];
   reflectionOutput?: string;
   toolsUsed?: Array<{ name: string; result?: string }>;
+  runtimeContext?: {
+    run_id: string;
+    environment?: string;
+    provider?: string;
+    model?: string;
+  };
 }
 
 // ============================================================================
@@ -148,6 +154,7 @@ export class AutoSaver {
       if (context.sessionGoals) this.extractionContext.sessionGoals = context.sessionGoals;
       if (context.reflectionOutput) this.extractionContext.reflectionOutput = context.reflectionOutput;
       if (context.toolsUsed) this.extractionContext.toolsUsed = context.toolsUsed;
+      if (context.runtimeContext) this.extractionContext.runtimeContext = context.runtimeContext;
     }
 
     const captureMode = this.config.captureMode || 'tools';
@@ -172,6 +179,7 @@ export class AutoSaver {
           agent_version: this.config.agentVersion,
           active: true,
         };
+        this.applyRuntimeContext(entry);
         this.handleSupersession(entry);
         this.stateEntries.push(entry);
         return entry;
@@ -192,6 +200,7 @@ export class AutoSaver {
         agent_version: this.config.agentVersion,
         active: true,
       };
+      this.applyRuntimeContext(entry);
       this.stateEntries.push(entry);
       return entry;
     }
@@ -237,6 +246,7 @@ export class AutoSaver {
       }
     }
 
+    this.applyRuntimeContext(entry);
     this.handleSupersession(entry);
     this.stateEntries.push(entry);
     return entry;
@@ -300,6 +310,19 @@ export class AutoSaver {
   }
 
   /**
+   * Apply runtime context fields to an entry
+   */
+  private applyRuntimeContext(entry: AgentStateEntry): void {
+    const ctx = this.extractionContext.runtimeContext;
+    if (ctx) {
+      entry.run_id = ctx.run_id;
+      entry.environment = ctx.environment;
+      entry.provider = ctx.provider;
+      entry.model = ctx.model;
+    }
+  }
+
+  /**
    * Handle supersession of previous entries with same goal
    */
   private handleSupersession(entry: AgentStateEntry): void {
@@ -349,6 +372,9 @@ export class AutoSaver {
     }
     if (context.sessionGoals !== undefined) {
       this.extractionContext.sessionGoals = context.sessionGoals;
+    }
+    if (context.runtimeContext !== undefined) {
+      this.extractionContext.runtimeContext = context.runtimeContext;
     }
   }
 

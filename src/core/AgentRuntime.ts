@@ -33,6 +33,7 @@ import { AutoSaver } from './AutoSaver';
 import { IdentityValidator } from './IdentityValidator';
 import { ReflectionEngine, Reflection, ReasoningTrace } from './ReflectionEngine';
 import { RecallBricksClient } from '../api/RecallBricksClient';
+import { randomUUID } from 'crypto';
 
 // ============================================================================
 // Runtime Version
@@ -380,6 +381,23 @@ export class AgentRuntime {
   }
 
   /**
+   * Get runtime context fields for state entries
+   */
+  private getRuntimeContext(runId: string): {
+    run_id: string;
+    environment?: string;
+    provider?: string;
+    model?: string;
+  } {
+    return {
+      run_id: runId,
+      environment: this.config.environment,
+      provider: this.config.llmConfig?.provider,
+      model: this.config.llmConfig?.model,
+    };
+  }
+
+  /**
    * Send a chat message and get a contextual response
    *
    * This is the main entry point for the runtime
@@ -394,7 +412,13 @@ export class AgentRuntime {
     });
 
     const startTime = Date.now();
+    const runId = randomUUID();
     this.interactionCount++;
+
+    // Set runtime context for all state entries created during this call
+    this.autoSaver.updateExtractionContext({
+      runtimeContext: this.getRuntimeContext(runId),
+    });
 
     try {
       // Step 1: Save previous turn (if exists)
@@ -1114,6 +1138,10 @@ export class AgentRuntime {
       source: 'explicit',
       agent_version: this.config.agentVersion,
       active: true,
+      run_id: randomUUID(),
+      environment: this.config.environment,
+      provider: this.config.llmConfig?.provider,
+      model: this.config.llmConfig?.model,
     };
 
     // Auto-create constraint if provided
@@ -1169,6 +1197,10 @@ export class AgentRuntime {
       source: 'explicit',
       agent_version: this.config.agentVersion,
       active: true,
+      run_id: randomUUID(),
+      environment: this.config.environment,
+      provider: this.config.llmConfig?.provider,
+      model: this.config.llmConfig?.model,
     };
 
     // Supersede prior failures for the same goal

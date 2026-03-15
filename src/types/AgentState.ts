@@ -54,6 +54,12 @@ export interface AgentStateEntry {
   // Source tracking
   source?: 'auto' | 'explicit';
   agent_version?: string;
+
+  // Runtime context
+  run_id?: string;
+  environment?: string;
+  provider?: string;
+  model?: string;
 }
 
 // ============================================================================

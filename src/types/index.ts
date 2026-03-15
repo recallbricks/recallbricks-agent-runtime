@@ -114,6 +114,7 @@ export interface RuntimeConfig {
   allowedTools?: string[];
   agentVersion?: string;
   captureMode?: CaptureMode;
+  environment?: string;
 }
 
 export interface RuntimeOptions {
@@ -138,6 +139,7 @@ export interface RuntimeOptions {
   allowedTools?: string[];
   agentVersion?: string;
   captureMode?: CaptureMode;
+  environment?: string;
 }
 
 // ============================================================================

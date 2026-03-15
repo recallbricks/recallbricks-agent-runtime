@@ -280,6 +280,10 @@ export class RecallBricksClient {
           recovered_from: entry.recovered_from,
           created_constraint: entry.created_constraint,
           active: entry.active,
+          run_id: entry.run_id,
+          environment: entry.environment,
+          provider: entry.provider,
+          model: entry.model,
         },
       });
       return { id: memResponse.id, created_at: memResponse.created_at };

@@ -213,6 +213,7 @@ export class ConfigBuilder {
       allowedTools: options.allowedTools,
       agentVersion: options.agentVersion,
       captureMode: options.captureMode || 'tools',
+      environment: options.environment,
     };
 
     this.validateConfig(config);

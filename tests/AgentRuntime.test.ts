@@ -668,4 +668,73 @@ describe('AgentRuntime', () => {
       expect(log[1].timestamp).toBe('2026-01-01T00:00:00Z');
     });
   });
+
+  describe('runtime context fields', () => {
+    it('state entry from chat() has run_id, provider, model populated', async () => {
+      mockAxiosInstance.post.mockImplementation((url: string) => {
+        if (url.includes('/search')) {
+          return Promise.resolve({ data: { memories: [], total: 0 } });
+        }
+        if (url.includes('/constraints/') && url.includes('/check')) {
+          return Promise.resolve({ data: { allowed: true, violations: [] } });
+        }
+        return Promise.resolve({
+          data: { id: 'mem_1', text: 'ok', created_at: new Date().toISOString() },
+        });
+      });
+
+      const runtime = new AgentRuntime({
+        agentId: 'test_agent',
+        userId: 'test_user',
+        llmProvider: 'anthropic',
+        llmApiKey: 'test_key',
+        apiKey: 'rb_test',
+        autoSave: true,
+        debug: true,
+      });
+
+      // First chat creates no state entry yet (no previous turn)
+      await runtime.chat('First message');
+      // Second chat saves state for the first turn
+      await runtime.chat('Second message');
+
+      const entries = runtime.getStateEntries();
+      expect(entries.length).toBeGreaterThanOrEqual(1);
+      const entry = entries[0];
+      expect(entry.run_id).toBeDefined();
+      expect(typeof entry.run_id).toBe('string');
+      expect(entry.run_id!.length).toBeGreaterThan(0);
+      expect(entry.provider).toBe('anthropic');
+      expect(entry.model).toBeDefined();
+    });
+
+    it('reportFailure() has environment populated when configured', async () => {
+      mockAxiosInstance.post.mockResolvedValue({
+        data: { id: 'mem_1', text: 'ok', created_at: new Date().toISOString() },
+      });
+
+      const runtime = new AgentRuntime({
+        agentId: 'test_agent',
+        userId: 'test_user',
+        llmProvider: 'anthropic',
+        llmApiKey: 'test_key',
+        apiKey: 'rb_test',
+        environment: 'staging',
+        debug: true,
+      });
+
+      const entry = await runtime.reportFailure({
+        goal: 'deploy service',
+        action: 'ran deploy script',
+        tool_name: 'deploy',
+        error_code: '500',
+        result: 'Internal server error',
+      });
+
+      expect(entry.environment).toBe('staging');
+      expect(entry.run_id).toBeDefined();
+      expect(entry.provider).toBe('anthropic');
+      expect(entry.model).toBeDefined();
+    });
+  });
 });
